@@ -20,14 +20,16 @@ const (
 	StateNone = iota
 	StateAwaitingShowName
 	StateAwaitingShowSelection
+	StateAwaitingSeasonEpisode
 )
 
 type Bot struct {
-	BotApi        *tgbotapi.BotAPI
-	DB            *sql.DB
-	States        map[int64]UserState
-	SearchResults map[int64][]ShowSearchResult
-	mu            sync.Mutex
+	BotApi         *tgbotapi.BotAPI
+	DB             *sql.DB
+	States         map[int64]UserState
+	SearchResults  map[int64][]ShowSearchResult
+	SelectedResult int
+	mu             sync.Mutex
 }
 
 func main() {
@@ -78,6 +80,8 @@ func main() {
 			bot.acceptShowName(msg)
 		case state == StateAwaitingShowSelection:
 			bot.acceptSearchResult(msg)
+		case state == StateAwaitingSeasonEpisode:
+			bot.acceptSeasonEpisode(msg)
 		}
 	}
 }
@@ -208,6 +212,7 @@ func (bot *Bot) acceptSearchResult(msg *tgbotapi.Message) {
 		log.Printf("Error adding show: %s\n", err)
 		return
 	}
+	bot.SelectedResult = idx - 1
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -233,7 +238,60 @@ func (bot *Bot) acceptSearchResult(msg *tgbotapi.Message) {
 		}
 	}
 
-	bot.reply(msg.Chat.ID, fmt.Sprintf("TV show \"%s\" added", showSearchResult.Name))
+	bot.reply(
+		msg.Chat.ID,
+		fmt.Sprintf(
+			"TV show \"%s\" added. Which season and episode are you on?",
+			showSearchResult.Name,
+		),
+	)
+	bot.setState(userID, StateAwaitingSeasonEpisode)
+}
+
+func (bot *Bot) acceptSeasonEpisode(msg *tgbotapi.Message) {
+	text := strings.TrimSpace(msg.Text)
+	userID := msg.From.ID
+	chatID := msg.Chat.ID
+	parts := strings.Split(text, " ")
+	if len(parts) != 2 {
+		bot.reply(chatID, "Wrong format of the reply, it should be: #season #episode")
+		return
+	}
+	season, err := strconv.Atoi(parts[0])
+	if err != nil {
+		bot.reply(chatID, "Wrong #season")
+		return
+	}
+	number, err := strconv.Atoi(parts[1])
+	if err != nil {
+		bot.reply(chatID, "Wrong #episode")
+		return
+	}
+	selectedShow := bot.SearchResults[userID][bot.SelectedResult]
+	nextEpisode, err := findEpisodeByNumber(
+		bot.DB, strconv.Itoa(selectedShow.ID), season, number+1,
+	)
+	if err != nil {
+		bot.reply(chatID, "I can't find next episode to remind you :(")
+		return
+	}
+
+	if nextEpisode.Airdate != "" {
+		airstampTime, err := time.Parse(time.RFC3339, nextEpisode.Airdate)
+		if err != nil {
+			return
+		}
+		err = createReminder(bot.DB, userID, 1, airstampTime)
+		if err != nil {
+			return
+		}
+		bot.reply(
+			chatID,
+			fmt.Sprintf(
+				"Reminder created for next episode \"%s\", which is expected to air on %s",
+				nextEpisode.Name, airstampTime.Format("Mon Jan 2, 15:04"),
+			))
+	}
 }
 
 func safeString(s *string) string {
