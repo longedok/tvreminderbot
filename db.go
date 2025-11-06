@@ -8,6 +8,45 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// Database models - separate from API models
+
+type DBShow struct {
+	ID                    int64
+	UserID                int64
+	Name                  string
+	Provider              string
+	ProviderShowID        string
+	Timezone              string
+	LastNotifiedEpisodeID *string
+	CreatedAt             time.Time
+}
+
+type DBEpisode struct {
+	ID                int64
+	Provider          string
+	ProviderShowID    string
+	ProviderEpisodeID string
+	Season            int
+	Number            int
+	Title             string
+	Airdate           string
+	Airtime           string
+	AiredAtUTC        time.Time
+	FetchedAt         time.Time
+}
+
+type DBReminder struct {
+	ID            int64
+	UserID        int64
+	ShowID        int64
+	EpisodeID     int64
+	RemindAt      time.Time
+	ChatID        int64
+	ShowName      string
+	EpisodeTitle  string
+	EpisodeNumber int
+}
+
 func openDB() (*sql.DB, error) {
 	db, err := sql.Open("sqlite", "tvreminder.db")
 	if err != nil {
@@ -48,8 +87,11 @@ func openDB() (*sql.DB, error) {
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			user_id INTEGER NOT NULL,
 			show_id INTEGER NOT NULL,
+			episode_id INTEGER,
 			remind_at DATETIME NOT NULL,
-			FOREIGN KEY (show_id) REFERENCES shows(id)
+			chat_id INTEGER NOT NULL,
+			FOREIGN KEY (show_id) REFERENCES shows(id),
+			FOREIGN KEY (episode_id) REFERENCES episodes_cache(id),
 			UNIQUE(user_id, show_id)
 		);
 
@@ -67,13 +109,35 @@ func openDB() (*sql.DB, error) {
 	return db, nil
 }
 
-func addShow(db *sql.DB, userID int64, name, provider string, showID int) error {
-	_, err := db.Exec(`
+func addShow(db *sql.DB, userID int64, name, provider string, showID int) (int64, error) {
+	result, err := db.Exec(`
 		INSERT INTO shows (user_id, name, provider, provider_show_id)
 		VALUES (?, ?, ?, ?)
 		ON CONFLICT DO NOTHING
 	`, userID, name, provider, showID)
-	return err
+	if err != nil {
+		return 0, err
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+
+	if rowsAffected > 0 {
+		return result.LastInsertId()
+	}
+
+	var internalID int64
+	err = db.QueryRow(`
+		SELECT id FROM shows 
+		WHERE user_id = ? AND provider = ? AND provider_show_id = ?
+	`, userID, provider, showID).Scan(&internalID)
+	if err != nil {
+		return 0, err
+	}
+
+	return internalID, nil
 }
 
 func listShows(db *sql.DB, userID int64) ([]string, error) {
@@ -119,36 +183,75 @@ func upsertEpisode(
 	return err
 }
 
-func findEpisodeByNumber(db *sql.DB, providerShowId string, season, number int) (*Episode, error) {
-	rows, err := db.Query(`
+func findEpisodeByNumber(db *sql.DB, providerShowId string, season, number int) (*DBEpisode, error) {
+	var episode DBEpisode
+	var airedAtStr string
+	var fetchedAtStr string
+
+	err := db.QueryRow(`
 		SELECT
-			provider_episode_id, season, number, title, airdate
+			id, provider, provider_show_id, provider_episode_id, season, number, 
+			title, airdate, airtime, aired_at_utc, fetched_at
 		FROM episodes_cache
 		WHERE provider_show_id = ? and season = ? and number = ?
-	`, providerShowId, season, number)
+	`, providerShowId, season, number).Scan(
+		&episode.ID, &episode.Provider, &episode.ProviderShowID, &episode.ProviderEpisodeID,
+		&episode.Season, &episode.Number, &episode.Title, &episode.Airdate, &episode.Airtime,
+		&airedAtStr, &fetchedAtStr,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, errors.New("episode not found")
+	}
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	var episode Episode
-	if rows.Next() {
-		if err := rows.Scan(&episode.ID, &episode.Season, &episode.Number,
-			&episode.Name, &episode.Airdate); err != nil {
-			return nil, err
-		}
-		return &episode, err
+	if airedAtStr != "" {
+		episode.AiredAtUTC, _ = time.Parse(time.RFC3339, airedAtStr)
+	}
+	if fetchedAtStr != "" {
+		episode.FetchedAt, _ = time.Parse(time.RFC3339, fetchedAtStr)
 	}
 
-	return nil, errors.New("episode not found")
+	return &episode, nil
 }
 
-func createReminder(db *sql.DB, userID int64, showID int, remindAt time.Time) error {
+func createReminder(db *sql.DB, userID int64, showID int, episodeID int64, remindAt time.Time, chatID int64) error {
 	_, err := db.Exec(`
-		INSERT INTO reminders (user_id, show_id, remind_at)
-		VALUES (?, ?, ?)
+		INSERT INTO reminders (user_id, show_id, episode_id, remind_at, chat_id)
+		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT DO NOTHING
-	`, userID, showID, remindAt)
+	`, userID, showID, episodeID, remindAt, chatID)
 
 	return err
+}
+
+func getDueReminders(db *sql.DB) ([]DBReminder, error) {
+	rows, err := db.Query(`
+		SELECT
+			r.id, r.user_id, r.show_id, r.episode_id, r.remind_at, r.chat_id,
+			s.name, e.title, e.number
+		FROM reminders r
+		LEFT JOIN shows s ON s.id = r.show_id
+		LEFT JOIN episodes_cache e ON e.id = r.episode_id
+		WHERE r.remind_at <= DATETIME('now', '+5 minutes')
+		`)
+	if err != nil {
+		return nil, err
+	}
+	var reminders []DBReminder
+	for rows.Next() {
+		var reminder DBReminder
+		if err := rows.Scan(
+			&reminder.ID, &reminder.UserID, &reminder.ShowID, &reminder.EpisodeID,
+			&reminder.RemindAt, &reminder.ChatID, &reminder.ShowName,
+			&reminder.EpisodeTitle, &reminder.EpisodeNumber,
+		); err != nil {
+			return nil, err
+		}
+		reminders = append(reminders, reminder)
+	}
+
+	return reminders, nil
 }

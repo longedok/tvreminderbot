@@ -23,13 +23,19 @@ const (
 	StateAwaitingSeasonEpisode
 )
 
+type UserContext struct {
+	State              UserState
+	SearchResults      []ShowSearchResult
+	SelectedInternalID int64
+	SelectedProviderID int
+	SelectedShowName   string
+}
+
 type Bot struct {
-	BotApi         *tgbotapi.BotAPI
-	DB             *sql.DB
-	States         map[int64]UserState
-	SearchResults  map[int64][]ShowSearchResult
-	SelectedResult int
-	mu             sync.Mutex
+	BotApi       *tgbotapi.BotAPI
+	DB           *sql.DB
+	UserContexts map[int64]*UserContext
+	mu           sync.Mutex
 }
 
 func main() {
@@ -52,16 +58,17 @@ func main() {
 	defer db.Close()
 
 	bot := &Bot{
-		BotApi:        botApi,
-		DB:            db,
-		States:        make(map[int64]UserState),
-		SearchResults: make(map[int64][]ShowSearchResult),
+		BotApi:       botApi,
+		DB:           db,
+		UserContexts: make(map[int64]*UserContext),
 	}
 
 	updateConfig := tgbotapi.NewUpdate(0)
 	updateConfig.Timeout = 30
 
 	updates := botApi.GetUpdatesChan(updateConfig)
+
+	go bot.reminderLoop(context.Background())
 
 	for update := range updates {
 		if update.Message == nil {
@@ -121,23 +128,77 @@ func (bot *Bot) handleCommand(msg *tgbotapi.Message) {
 	}
 }
 
-func (bot *Bot) setState(userID int64, state UserState) {
+func (bot *Bot) reminderLoop(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			log.Println("reminderLoop: tick")
+			reminders, err := getDueReminders(bot.DB)
+			if err != nil {
+				log.Printf("reminderLoop: getDueReminders error: %v", err)
+				continue
+			}
+			if len(reminders) == 0 {
+				log.Println("reminderLoop: no reminders due")
+			} else {
+				log.Printf("reminderLoop: %d reminders due", len(reminders))
+			}
+			for _, r := range reminders {
+				log.Printf(
+					"reminderLoop: sending reminder chat=%d show=%q episode=%d title=%q",
+					r.ChatID, r.ShowName, r.EpisodeNumber, r.EpisodeTitle,
+				)
+				bot.reply(
+					r.ChatID,
+					fmt.Sprintf(
+						"New episode \"%d. %s\" of \"%s\" is coming out today!",
+						r.EpisodeNumber, r.EpisodeTitle, r.ShowName,
+					),
+				)
+			}
+		case <-ctx.Done():
+			log.Println("reminderLoop: context cancelled, exiting")
+			return
+		}
+	}
+}
+
+func (bot *Bot) withUserContext(userID int64, fn func(*UserContext)) {
 	bot.mu.Lock()
 	defer bot.mu.Unlock()
-	bot.States[userID] = state
+	if bot.UserContexts[userID] == nil {
+		bot.UserContexts[userID] = &UserContext{}
+	}
+	fn(bot.UserContexts[userID])
+}
+
+func (bot *Bot) getUserContext(userID int64) *UserContext {
+	bot.mu.Lock()
+	defer bot.mu.Unlock()
+	return bot.UserContexts[userID]
+}
+
+func (bot *Bot) setState(userID int64, state UserState) {
+	bot.withUserContext(userID, func(ctx *UserContext) {
+		ctx.State = state
+	})
 }
 
 func (bot *Bot) getState(userID int64) UserState {
-	bot.mu.Lock()
-	defer bot.mu.Unlock()
-	return bot.States[userID]
+	ctx := bot.getUserContext(userID)
+	if ctx == nil {
+		return StateNone
+	}
+	return ctx.State
 }
 
 func (bot *Bot) clearState(userID int64) {
 	bot.mu.Lock()
 	defer bot.mu.Unlock()
-	delete(bot.States, userID)
-	delete(bot.SearchResults, userID)
+	delete(bot.UserContexts, userID)
 }
 
 func (bot *Bot) reply(chatID int64, text string) {
@@ -171,20 +232,18 @@ func (bot *Bot) acceptShowName(msg *tgbotapi.Message) {
 			return
 		}
 
-		showIds := make([]int, 0)
 		replyText := "Found:\n"
 		for i, r := range results[:min(5, len(results))] {
 			replyText += fmt.Sprintf("%d. %s (%s)\n", i+1, r.Name, safeString(r.Premiered))
-			showIds = append(showIds, r.ID)
 		}
 
-		bot.mu.Lock()
-		bot.SearchResults[userID] = results
-		bot.mu.Unlock()
+		bot.withUserContext(userID, func(ctx *UserContext) {
+			ctx.SearchResults = results
+			ctx.State = StateAwaitingShowSelection
+		})
 
 		replyText += "Send the number:"
 		bot.reply(chatID, replyText)
-		bot.setState(userID, StateAwaitingShowSelection)
 	}
 }
 
@@ -198,21 +257,33 @@ func (bot *Bot) acceptSearchResult(msg *tgbotapi.Message) {
 		return
 	}
 
-	searchResults := bot.SearchResults[userID]
+	userCtx := bot.getUserContext(userID)
+	if userCtx == nil || len(userCtx.SearchResults) == 0 {
+		bot.reply(msg.Chat.ID, "No search results found. Please start over.")
+		bot.clearState(userID)
+		return
+	}
 
 	if idx < 1 || idx > 5 {
 		bot.reply(msg.Chat.ID, "Invalid number.")
 		return
 	}
 
-	showSearchResult := searchResults[idx-1]
+	showSearchResult := userCtx.SearchResults[idx-1]
 
-	err = addShow(bot.DB, userID, showSearchResult.Name, "tvmaze", showSearchResult.ID)
+	internalID, err := addShow(
+		bot.DB, userID, showSearchResult.Name, "tvmaze", showSearchResult.ID,
+	)
 	if err != nil {
 		log.Printf("Error adding show: %s\n", err)
 		return
 	}
-	bot.SelectedResult = idx - 1
+
+	bot.withUserContext(userID, func(ctx *UserContext) {
+		ctx.SelectedInternalID = internalID
+		ctx.SelectedProviderID = showSearchResult.ID
+		ctx.SelectedShowName = showSearchResult.Name
+	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -267,21 +338,27 @@ func (bot *Bot) acceptSeasonEpisode(msg *tgbotapi.Message) {
 		bot.reply(chatID, "Wrong #episode")
 		return
 	}
-	selectedShow := bot.SearchResults[userID][bot.SelectedResult]
+
+	userCtx := bot.getUserContext(userID)
+	if userCtx == nil {
+		bot.reply(chatID, "Session expired. Please start over with /add")
+		bot.clearState(userID)
+		return
+	}
+
 	nextEpisode, err := findEpisodeByNumber(
-		bot.DB, strconv.Itoa(selectedShow.ID), season, number+1,
+		bot.DB, strconv.Itoa(userCtx.SelectedProviderID), season, number+1,
 	)
 	if err != nil {
 		bot.reply(chatID, "I can't find next episode to remind you :(")
 		return
 	}
 
-	if nextEpisode.Airdate != "" {
-		airstampTime, err := time.Parse(time.RFC3339, nextEpisode.Airdate)
-		if err != nil {
-			return
-		}
-		err = createReminder(bot.DB, userID, 1, airstampTime)
+	if !nextEpisode.AiredAtUTC.IsZero() {
+		err = createReminder(
+			bot.DB, userID, int(userCtx.SelectedInternalID), nextEpisode.ID,
+			nextEpisode.AiredAtUTC, chatID,
+		)
 		if err != nil {
 			return
 		}
@@ -289,7 +366,7 @@ func (bot *Bot) acceptSeasonEpisode(msg *tgbotapi.Message) {
 			chatID,
 			fmt.Sprintf(
 				"Reminder created for next episode \"%s\", which is expected to air on %s",
-				nextEpisode.Name, airstampTime.Format("Mon Jan 2, 15:04"),
+				nextEpisode.Title, nextEpisode.AiredAtUTC.Format("Mon Jan 2, 15:04"),
 			))
 	}
 }
