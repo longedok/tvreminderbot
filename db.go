@@ -48,6 +48,12 @@ type DBReminder struct {
 	EpisodeSeason int
 }
 
+type ShowProgress struct {
+	Name    string
+	Season  sql.NullInt32
+	Episode sql.NullInt32
+}
+
 func openDB() (*sql.DB, error) {
 	db, err := sql.Open("sqlite", "tvreminder.db")
 	if err != nil {
@@ -159,6 +165,31 @@ func listShows(db *sql.DB, userID int64) ([]string, error) {
 	return shows, nil
 }
 
+func listShowsWithProgress(db *sql.DB, userID int64) ([]ShowProgress, error) {
+	rows, err := db.Query(`
+		SELECT s.name, e.season, e.number
+		FROM shows s
+		LEFT JOIN episodes_cache e ON e.id = s.last_watched_episode_id
+		WHERE s.user_id = ?
+		ORDER BY s.name
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var shows []ShowProgress
+	for rows.Next() {
+		var show ShowProgress
+		err := rows.Scan(&show.Name, &show.Season, &show.Episode)
+		if err != nil {
+			return nil, err
+		}
+		shows = append(shows, show)
+	}
+	return shows, nil
+}
+
 func upsertEpisode(
 	db *sql.DB,
 	provider, showID, episodeID, title string,
@@ -264,6 +295,66 @@ func updateLastWatchedEpisode(db *sql.DB, showID int64, episodeID int64) error {
 		WHERE id = ?
 	`, episodeID, showID)
 	return err
+}
+
+func getSeasons(db *sql.DB, providerShowID string) ([]int, error) {
+	rows, err := db.Query(`
+		SELECT DISTINCT season
+		FROM episodes_cache
+		WHERE provider_show_id = ?
+		ORDER BY season
+	`, providerShowID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var seasons []int
+	for rows.Next() {
+		var season int
+		if err := rows.Scan(&season); err != nil {
+			return nil, err
+		}
+		seasons = append(seasons, season)
+	}
+	return seasons, nil
+}
+
+func getEpisodesBySeason(db *sql.DB, providerShowID string, season int) ([]DBEpisode, error) {
+	rows, err := db.Query(`
+		SELECT
+			id, provider, provider_show_id, provider_episode_id, season, number,
+			title, airdate, airtime, aired_at_utc, fetched_at
+		FROM episodes_cache
+		WHERE provider_show_id = ? AND season = ?
+		ORDER BY number
+	`, providerShowID, season)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var episodes []DBEpisode
+	for rows.Next() {
+		var episode DBEpisode
+		var airedAtStr, fetchedAtStr string
+		err := rows.Scan(
+			&episode.ID, &episode.Provider, &episode.ProviderShowID, &episode.ProviderEpisodeID,
+			&episode.Season, &episode.Number, &episode.Title, &episode.Airdate, &episode.Airtime,
+			&airedAtStr, &fetchedAtStr,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if airedAtStr != "" {
+			episode.AiredAtUTC, _ = time.Parse(time.RFC3339, airedAtStr)
+		}
+		if fetchedAtStr != "" {
+			episode.FetchedAt, _ = time.Parse(time.RFC3339, fetchedAtStr)
+		}
+		episodes = append(episodes, episode)
+	}
+	return episodes, nil
 }
 
 func markReminderSent(db *sql.DB, reminder DBReminder) error {

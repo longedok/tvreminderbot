@@ -29,6 +29,7 @@ type UserContext struct {
 	SearchResults      []ShowSearchResult
 	SelectedInternalID int64
 	SelectedProviderID int
+	SelectedSeason     int
 }
 
 type Bot struct {
@@ -50,6 +51,17 @@ func main() {
 	}
 
 	log.Printf("Authorized on account %s", botApi.Self.UserName)
+
+	// Set bot commands for menu
+	commands := []tgbotapi.BotCommand{
+		{Command: "start", Description: "Start the bot"},
+		{Command: "help", Description: "Show help information"},
+		{Command: "add", Description: "Add a TV show to track"},
+		{Command: "shows", Description: "List your tracked shows"},
+	}
+	if _, err := botApi.Request(tgbotapi.NewSetMyCommands(commands...)); err != nil {
+		log.Printf("Failed to set bot commands: %v", err)
+	}
 
 	db, err := openDB()
 	if err != nil {
@@ -116,7 +128,7 @@ func (bot *Bot) handleCommand(msg *tgbotapi.Message) {
 	case "add":
 		bot.handleAddCommand(msg)
 	case "shows":
-		shows, err := listShows(bot.DB, msg.From.ID)
+		shows, err := listShowsWithProgress(bot.DB, msg.From.ID)
 		if err != nil {
 			bot.reply(chatID, "Error: can't list shows at this time")
 			return
@@ -124,7 +136,15 @@ func (bot *Bot) handleCommand(msg *tgbotapi.Message) {
 		if len(shows) == 0 {
 			bot.reply(chatID, "You have no shows yet. Use /add <show> to add one.")
 		} else {
-			bot.reply(chatID, "Your shows:\n"+strings.Join(shows, "\n"))
+			var showLines []string
+			for _, show := range shows {
+				if show.Season.Valid && show.Episode.Valid {
+					showLines = append(showLines, fmt.Sprintf("%s (S%dE%d)", show.Name, show.Season.Int32, show.Episode.Int32))
+				} else {
+					showLines = append(showLines, show.Name)
+				}
+			}
+			bot.reply(chatID, "Your shows:\n"+strings.Join(showLines, "\n"))
 		}
 	default:
 		bot.reply(chatID, "Unknown command: /"+command)
@@ -134,18 +154,25 @@ func (bot *Bot) handleCommand(msg *tgbotapi.Message) {
 func (bot *Bot) handleCallback(cb *tgbotapi.CallbackQuery) {
 	data := cb.Data
 	parts := strings.Split(data, ":")
-	if len(parts) != 2 {
+	if len(parts) < 1 {
 		log.Printf("handleCallback: invalid callback data: %s", data)
 		return
 	}
 	action := parts[0]
-	param := parts[1]
+	param := ""
+	if len(parts) > 1 {
+		param = parts[1]
+	}
 
 	switch action {
 	case "acceptShowName":
 		bot.acceptShowNameCallback(cb, param)
-	case "acceptSeasonEpisode":
-		bot.acceptSeasonEpisodeCallback(cb, param)
+	case "selectSeason":
+		bot.handleSeasonCallback(cb, param)
+	case "selectEpisode":
+		bot.handleEpisodeCallback(cb, param)
+	case "cancel":
+		bot.handleCancelCallback(cb)
 	}
 }
 
@@ -228,19 +255,22 @@ func (bot *Bot) clearState(userID int64) {
 
 func (bot *Bot) reply(chatID int64, text string) {
 	message := tgbotapi.NewMessage(chatID, text)
+	message.ReplyMarkup = tgbotapi.ReplyKeyboardRemove{RemoveKeyboard: true}
 	bot.BotApi.Send(message)
 }
 
 func (bot *Bot) handleAddCommand(msg *tgbotapi.Message) {
 	chatID := msg.Chat.ID
-	bot.reply(chatID, "Enter show name:")
-	bot.setState(msg.From.ID, StateAwaitingShowName)
+	args := strings.TrimSpace(msg.CommandArguments())
+	if args != "" {
+		bot.searchAndSelectShow(args, msg.From.ID, chatID)
+	} else {
+		bot.reply(chatID, "Enter show name:")
+		bot.setState(msg.From.ID, StateAwaitingShowName)
+	}
 }
 
-func (bot *Bot) acceptShowName(msg *tgbotapi.Message) {
-	query := msg.Text
-	chatID := msg.Chat.ID
-	userID := msg.From.ID
+func (bot *Bot) searchAndSelectShow(query string, userID int64, chatID int64) {
 	if query == "" {
 		bot.reply(chatID, "Enter show name")
 		return
@@ -253,7 +283,7 @@ func (bot *Bot) acceptShowName(msg *tgbotapi.Message) {
 		bot.reply(chatID, "Error searching show "+query)
 	} else {
 		if len(results) == 0 {
-			bot.reply(msg.Chat.ID, "No shows found for: "+query)
+			bot.reply(chatID, "No shows found for: "+query)
 			return
 		}
 
@@ -267,6 +297,7 @@ func (bot *Bot) acceptShowName(msg *tgbotapi.Message) {
 			cb := fmt.Sprintf("acceptShowName:%d", i+1)
 			rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData(label, cb)))
 		}
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("❌ Cancel", "cancel")))
 		inlineMarkup := tgbotapi.NewInlineKeyboardMarkup(rows...)
 
 		bot.withUserContext(userID, func(ctx *UserContext) {
@@ -275,15 +306,17 @@ func (bot *Bot) acceptShowName(msg *tgbotapi.Message) {
 		})
 
 		listText := "Pick the show you want to add:"
-		// for i := range max {
-		// 	r := results[i]
-		// 	listText += fmt.Sprintf("%d. %s (%s)\n", i+1, r.Name, safeString(r.Premiered))
-		// }
-		// listText += "Tap a button below to select:"
 		m := tgbotapi.NewMessage(chatID, listText)
 		m.ReplyMarkup = inlineMarkup
 		bot.BotApi.Send(m)
 	}
+}
+
+func (bot *Bot) acceptShowName(msg *tgbotapi.Message) {
+	query := msg.Text
+	chatID := msg.Chat.ID
+	userID := msg.From.ID
+	bot.searchAndSelectShow(query, userID, chatID)
 }
 
 func (bot *Bot) acceptShowNameCallback(cb *tgbotapi.CallbackQuery, param string) {
@@ -345,15 +378,54 @@ func (bot *Bot) acceptShowNameCallback(cb *tgbotapi.CallbackQuery, param string)
 		}
 	}
 
-	bot.reply(
-		msg.Chat.ID,
-		fmt.Sprintf(
-			"TV show \"%s\" added. Which season and episode are you on?",
-			showSearchResult.Name,
-		),
-	)
-	bot.setState(userID, StateAwaitingSeasonEpisode)
+	// Get seasons for the show
+	seasons, err := getSeasons(bot.DB, strconv.Itoa(showSearchResult.ID))
+	if err != nil {
+		bot.reply(msg.Chat.ID, "Error fetching seasons")
+		return
+	}
 
+	if len(seasons) == 1 {
+		// Skip season selection, go directly to episode selection
+		bot.withUserContext(userID, func(ctx *UserContext) {
+			ctx.SelectedSeason = seasons[0]
+			ctx.State = StateAwaitingSeasonEpisode
+		})
+		// Get episodes for the single season
+		episodes, err := getEpisodesBySeason(bot.DB, strconv.Itoa(showSearchResult.ID), seasons[0])
+		if err != nil {
+			bot.reply(msg.Chat.ID, "Error fetching episodes")
+			return
+		}
+		var rows [][]tgbotapi.InlineKeyboardButton
+		for _, episode := range episodes {
+			label := fmt.Sprintf("%d. %s", episode.Number, episode.Title)
+			cbData := fmt.Sprintf("selectEpisode:%d", episode.Number)
+			rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData(label, cbData)))
+		}
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("❌ Cancel", "cancel")))
+		inlineMarkup := tgbotapi.NewInlineKeyboardMarkup(rows...)
+		text := fmt.Sprintf("TV show \"%s\" added. Which episode of season %d are you on?", showSearchResult.Name, seasons[0])
+		editMsg := tgbotapi.NewEditMessageText(msg.Chat.ID, msg.MessageID, text)
+		editMsg.ReplyMarkup = &inlineMarkup
+		bot.BotApi.Send(editMsg)
+	} else {
+		var rows [][]tgbotapi.InlineKeyboardButton
+		for _, season := range seasons {
+			label := fmt.Sprintf("Season %d", season)
+			cb := fmt.Sprintf("selectSeason:%d", season)
+			rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData(label, cb)))
+		}
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("❌ Cancel", "cancel")))
+		inlineMarkup := tgbotapi.NewInlineKeyboardMarkup(rows...)
+		bot.withUserContext(userID, func(ctx *UserContext) {
+			ctx.State = StateAwaitingSeasonEpisode
+		})
+		text := fmt.Sprintf("TV show \"%s\" added. Which season are you on?", showSearchResult.Name)
+		editMsg := tgbotapi.NewEditMessageText(msg.Chat.ID, msg.MessageID, text)
+		editMsg.ReplyMarkup = &inlineMarkup
+		bot.BotApi.Send(editMsg)
+	}
 	cb_response := tgbotapi.NewCallback(cb.ID, cb.Data)
 	bot.BotApi.Request(cb_response)
 }
@@ -385,19 +457,21 @@ func (bot *Bot) acceptSeasonEpisode(msg *tgbotapi.Message) {
 		return
 	}
 
+	// Find the current episode
+	currentEpisode, err := findEpisodeByNumber(
+		bot.DB, strconv.Itoa(userCtx.SelectedProviderID), season, number,
+	)
+	if err != nil {
+		bot.reply(chatID, "I can't find the episode you specified")
+		return
+	}
+
 	// Find the next episode
 	nextEpisode, err := findEpisodeByNumber(
 		bot.DB, strconv.Itoa(userCtx.SelectedProviderID), season, number+1,
 	)
 	if err != nil {
 		// No next episode found, record the current episode as last watched
-		currentEpisode, err := findEpisodeByNumber(
-			bot.DB, strconv.Itoa(userCtx.SelectedProviderID), season, number,
-		)
-		if err != nil {
-			bot.reply(chatID, "I can't find the episode you specified")
-			return
-		}
 		err = updateLastWatchedEpisode(bot.DB, userCtx.SelectedInternalID, currentEpisode.ID)
 		if err != nil {
 			bot.reply(chatID, "Failed to update progress")
@@ -409,7 +483,12 @@ func (bot *Bot) acceptSeasonEpisode(msg *tgbotapi.Message) {
 
 	// Check if next episode has an air date and if it's in the future
 	if !nextEpisode.AiredAtUTC.IsZero() && nextEpisode.AiredAtUTC.After(time.Now()) {
-		// Create reminder for future episode
+		// Update last watched to current episode and create reminder for future episode
+		err = updateLastWatchedEpisode(bot.DB, userCtx.SelectedInternalID, currentEpisode.ID)
+		if err != nil {
+			bot.reply(chatID, "Failed to update progress")
+			return
+		}
 		err = createReminder(
 			bot.DB, userID, int(userCtx.SelectedInternalID), nextEpisode.ID,
 			nextEpisode.AiredAtUTC, chatID,
@@ -426,13 +505,6 @@ func (bot *Bot) acceptSeasonEpisode(msg *tgbotapi.Message) {
 			))
 	} else {
 		// Next episode has already aired or no air date, record current episode as last watched
-		currentEpisode, err := findEpisodeByNumber(
-			bot.DB, strconv.Itoa(userCtx.SelectedProviderID), season, number,
-		)
-		if err != nil {
-			bot.reply(chatID, "I can't find the episode you specified")
-			return
-		}
 		err = updateLastWatchedEpisode(bot.DB, userCtx.SelectedInternalID, currentEpisode.ID)
 		if err != nil {
 			bot.reply(chatID, "Failed to update progress")
@@ -442,8 +514,154 @@ func (bot *Bot) acceptSeasonEpisode(msg *tgbotapi.Message) {
 	}
 }
 
+func (bot *Bot) handleSeasonCallback(cb *tgbotapi.CallbackQuery, param string) {
+	season, err := strconv.Atoi(param)
+	if err != nil {
+		log.Printf("handleSeasonCallback: invalid season: %s", param)
+		return
+	}
+
+	userID := cb.From.ID
+	msg := cb.Message
+
+	userCtx := bot.getUserContext(userID)
+	if userCtx == nil {
+		bot.reply(msg.Chat.ID, "Session expired. Please start over with /add")
+		bot.clearState(userID)
+		return
+	}
+
+	// Store selected season
+	bot.withUserContext(userID, func(ctx *UserContext) {
+		ctx.SelectedSeason = season
+	})
+
+	// Get episodes for the selected season
+	episodes, err := getEpisodesBySeason(bot.DB, strconv.Itoa(userCtx.SelectedProviderID), season)
+	if err != nil {
+		bot.reply(msg.Chat.ID, "Error fetching episodes")
+		return
+	}
+
+	var rows [][]tgbotapi.InlineKeyboardButton
+	for _, episode := range episodes {
+		label := fmt.Sprintf("%d. %s", episode.Number, episode.Title)
+		cbData := fmt.Sprintf("selectEpisode:%d", episode.Number)
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData(label, cbData)))
+	}
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("❌ Cancel", "cancel")))
+	inlineMarkup := tgbotapi.NewInlineKeyboardMarkup(rows...)
+
+	text := fmt.Sprintf("Which episode of season %d are you on?", season)
+	editMsg := tgbotapi.NewEditMessageText(msg.Chat.ID, msg.MessageID, text)
+	editMsg.ReplyMarkup = &inlineMarkup
+	bot.BotApi.Send(editMsg)
+
+	cb_response := tgbotapi.NewCallback(cb.ID, cb.Data)
+	bot.BotApi.Request(cb_response)
+}
+
+func (bot *Bot) handleEpisodeCallback(cb *tgbotapi.CallbackQuery, param string) {
+	episodeNumber, err := strconv.Atoi(param)
+	if err != nil {
+		log.Printf("handleEpisodeCallback: invalid episode number: %s", param)
+		return
+	}
+
+	userID := cb.From.ID
+	msg := cb.Message
+
+	userCtx := bot.getUserContext(userID)
+	if userCtx == nil {
+		bot.reply(msg.Chat.ID, "Session expired. Please start over with /add")
+		bot.clearState(userID)
+		return
+	}
+
+	season := userCtx.SelectedSeason
+
+	var resultText string
+
+	// Find the current episode
+	currentEpisode, err := findEpisodeByNumber(
+		bot.DB, strconv.Itoa(userCtx.SelectedProviderID), season, episodeNumber,
+	)
+	if err != nil {
+		bot.reply(msg.Chat.ID, "I can't find the episode you specified")
+		bot.clearState(userID)
+		return
+	}
+
+	// Find the next episode
+	nextEpisode, err := findEpisodeByNumber(
+		bot.DB, strconv.Itoa(userCtx.SelectedProviderID), season, episodeNumber+1,
+	)
+	if err != nil {
+		// No next episode found, record the current episode as last watched
+		err = updateLastWatchedEpisode(bot.DB, userCtx.SelectedInternalID, currentEpisode.ID)
+		if err != nil {
+			resultText = "Failed to update progress"
+		} else {
+			resultText = fmt.Sprintf("Marked episode \"%s\" as watched", currentEpisode.Title)
+		}
+	} else {
+		// Check if next episode has an air date and if it's in the future
+		if !nextEpisode.AiredAtUTC.IsZero() && nextEpisode.AiredAtUTC.After(time.Now()) {
+			// Update last watched to current episode and create reminder for future episode
+			err = updateLastWatchedEpisode(bot.DB, userCtx.SelectedInternalID, currentEpisode.ID)
+			if err != nil {
+				resultText = "Failed to update progress"
+			} else {
+				err = createReminder(
+					bot.DB, userID, int(userCtx.SelectedInternalID), nextEpisode.ID,
+					nextEpisode.AiredAtUTC, msg.Chat.ID,
+				)
+				if err != nil {
+					resultText = "Failed to create reminder"
+				} else {
+					resultText = fmt.Sprintf(
+						"Reminder created for next episode \"%s\", which is expected to air on %s",
+						nextEpisode.Title, nextEpisode.AiredAtUTC.Format("Mon Jan 2, 15:04"),
+					)
+				}
+			}
+		} else {
+			// Next episode has already aired or no air date, record current episode as last watched
+			err = updateLastWatchedEpisode(bot.DB, userCtx.SelectedInternalID, currentEpisode.ID)
+			if err != nil {
+				resultText = "Failed to update progress"
+			} else {
+				resultText = fmt.Sprintf("Marked episode \"%s\" as watched", currentEpisode.Title)
+			}
+		}
+	}
+
+	// Edit the message to show the result
+	editMsg := tgbotapi.NewEditMessageText(msg.Chat.ID, msg.MessageID, resultText)
+	editMsg.ReplyMarkup = nil
+	bot.BotApi.Send(editMsg)
+
+	bot.clearState(userID)
+
+	cb_response := tgbotapi.NewCallback(cb.ID, cb.Data)
+	bot.BotApi.Request(cb_response)
+}
+
+func (bot *Bot) handleCancelCallback(cb *tgbotapi.CallbackQuery) {
+	userID := cb.From.ID
+	msg := cb.Message
+
+	bot.clearState(userID)
+	editMsg := tgbotapi.NewEditMessageText(msg.Chat.ID, msg.MessageID, "Operation cancelled.")
+	editMsg.ReplyMarkup = nil
+	bot.BotApi.Send(editMsg)
+
+	cb_response := tgbotapi.NewCallback(cb.ID, cb.Data)
+	bot.BotApi.Request(cb_response)
+}
+
 func (bot *Bot) acceptSeasonEpisodeCallback(cb *tgbotapi.CallbackQuery, param string) {
-	// bot.acceptSeasonEpisode(msg)
+	// This method is now replaced by handleSeasonCallback and handleEpisodeCallback
 }
 
 func safeString(s *string) string {
