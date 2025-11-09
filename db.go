@@ -11,14 +11,14 @@ import (
 // Database models - separate from API models
 
 type DBShow struct {
-	ID                    int64
-	UserID                int64
-	Name                  string
-	Provider              string
-	ProviderShowID        string
-	Timezone              string
-	LastNotifiedEpisodeID *string
-	CreatedAt             time.Time
+	ID                   int64
+	UserID               int64
+	Name                 string
+	Provider             string
+	ProviderShowID       string
+	Timezone             string
+	LastWatchedEpisodeID *string
+	CreatedAt            time.Time
 }
 
 type DBEpisode struct {
@@ -45,6 +45,7 @@ type DBReminder struct {
 	ShowName      string
 	EpisodeTitle  string
 	EpisodeNumber int
+	EpisodeSeason int
 }
 
 func openDB() (*sql.DB, error) {
@@ -63,7 +64,7 @@ func openDB() (*sql.DB, error) {
 		  provider TEXT NOT NULL DEFAULT 'local',
 		  provider_show_id TEXT,
 		  timezone TEXT DEFAULT 'UTC',
-		  last_notified_episode_id TEXT,
+		  last_watched_episode_id TEXT,
 		  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		  UNIQUE(user_id, provider, provider_show_id)
 		);
@@ -231,7 +232,7 @@ func getDueReminders(db *sql.DB) ([]DBReminder, error) {
 	rows, err := db.Query(`
 		SELECT
 			r.id, r.user_id, r.show_id, r.episode_id, r.remind_at, r.chat_id,
-			s.name, e.title, e.number
+			s.name, e.title, e.number, e.season
 		FROM reminders r
 		LEFT JOIN shows s ON s.id = r.show_id
 		LEFT JOIN episodes_cache e ON e.id = r.episode_id
@@ -246,7 +247,7 @@ func getDueReminders(db *sql.DB) ([]DBReminder, error) {
 		if err := rows.Scan(
 			&reminder.ID, &reminder.UserID, &reminder.ShowID, &reminder.EpisodeID,
 			&reminder.RemindAt, &reminder.ChatID, &reminder.ShowName,
-			&reminder.EpisodeTitle, &reminder.EpisodeNumber,
+			&reminder.EpisodeTitle, &reminder.EpisodeNumber, &reminder.EpisodeSeason,
 		); err != nil {
 			return nil, err
 		}
@@ -254,4 +255,101 @@ func getDueReminders(db *sql.DB) ([]DBReminder, error) {
 	}
 
 	return reminders, nil
+}
+
+func updateLastWatchedEpisode(db *sql.DB, showID int64, episodeID int64) error {
+	_, err := db.Exec(`
+		UPDATE shows
+		SET last_watched_episode_id = ?
+		WHERE id = ?
+	`, episodeID, showID)
+	return err
+}
+
+func markReminderSent(db *sql.DB, reminder DBReminder) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Delete the current reminder
+	_, err = tx.Exec(`DELETE FROM reminders WHERE id = ?`, reminder.ID)
+	if err != nil {
+		return err
+	}
+
+	// Update the show's last_watched_episode_id
+	_, err = tx.Exec(`
+		UPDATE shows
+		SET last_watched_episode_id = ?
+		WHERE id = ?
+	`, reminder.EpisodeID, reminder.ShowID)
+	if err != nil {
+		return err
+	}
+
+	// Get current episode details to find the next one
+	var currentSeason, currentNumber int
+	err = tx.QueryRow(`
+		SELECT season, number FROM episodes_cache WHERE id = ?
+	`, reminder.EpisodeID).Scan(&currentSeason, &currentNumber)
+	if err != nil {
+		return err
+	}
+
+	// Find the next episode
+	var nextEpisode DBEpisode
+	var airedAtStr string
+	var fetchedAtStr string
+
+	err = tx.QueryRow(`
+		SELECT
+			id, provider, provider_show_id, provider_episode_id, season, number,
+			title, airdate, airtime, aired_at_utc, fetched_at
+		FROM episodes_cache
+		WHERE provider_show_id = (
+			SELECT provider_show_id FROM shows WHERE id = ?
+		)
+		AND (
+			(season = ? AND number > ?) OR
+			(season > ?)
+		)
+		ORDER BY season, number
+		LIMIT 1
+	`, reminder.ShowID, currentSeason, currentNumber, currentSeason).Scan(
+		&nextEpisode.ID, &nextEpisode.Provider, &nextEpisode.ProviderShowID, &nextEpisode.ProviderEpisodeID,
+		&nextEpisode.Season, &nextEpisode.Number, &nextEpisode.Title, &nextEpisode.Airdate, &nextEpisode.Airtime,
+		&airedAtStr, &fetchedAtStr,
+	)
+
+	if err == sql.ErrNoRows {
+		// No next episode found, just commit the delete and update
+		return tx.Commit()
+	}
+	if err != nil {
+		return err
+	}
+
+	// Parse timestamps
+	if airedAtStr != "" {
+		nextEpisode.AiredAtUTC, _ = time.Parse(time.RFC3339, airedAtStr)
+	}
+	if fetchedAtStr != "" {
+		nextEpisode.FetchedAt, _ = time.Parse(time.RFC3339, fetchedAtStr)
+	}
+
+	// Create reminder for next episode if it has an air date
+	if !nextEpisode.AiredAtUTC.IsZero() {
+		_, err = tx.Exec(`
+			INSERT INTO reminders (user_id, show_id, episode_id, remind_at, chat_id)
+			VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT DO NOTHING
+		`, reminder.UserID, reminder.ShowID, nextEpisode.ID, nextEpisode.AiredAtUTC, reminder.ChatID)
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
 }
