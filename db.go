@@ -18,6 +18,7 @@ type DBShow struct {
 	ProviderShowID       string
 	Timezone             string
 	LastWatchedEpisodeID *string
+	NotificationsEnabled bool
 	CreatedAt            time.Time
 }
 
@@ -49,9 +50,11 @@ type DBReminder struct {
 }
 
 type ShowProgress struct {
-	Name    string
-	Season  sql.NullInt32
-	Episode sql.NullInt32
+	Name                 string
+	Season               sql.NullInt32
+	Episode              sql.NullInt32
+	NextAirDate          sql.NullTime
+	NotificationsEnabled bool
 }
 
 func openDB() (*sql.DB, error) {
@@ -71,6 +74,7 @@ func openDB() (*sql.DB, error) {
 		  provider_show_id TEXT,
 		  timezone TEXT DEFAULT 'UTC',
 		  last_watched_episode_id TEXT,
+		  notifications_enabled INTEGER DEFAULT 1,
 		  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		  UNIQUE(user_id, provider, provider_show_id)
 		);
@@ -167,7 +171,7 @@ func listShows(db *sql.DB, userID int64) ([]string, error) {
 
 func listShowsWithProgress(db *sql.DB, userID int64) ([]ShowProgress, error) {
 	rows, err := db.Query(`
-		SELECT s.name, e.season, e.number
+		SELECT s.name, e.season, e.number, s.provider_show_id, s.notifications_enabled
 		FROM shows s
 		LEFT JOIN episodes_cache e ON e.id = s.last_watched_episode_id
 		WHERE s.user_id = ?
@@ -181,10 +185,20 @@ func listShowsWithProgress(db *sql.DB, userID int64) ([]ShowProgress, error) {
 	var shows []ShowProgress
 	for rows.Next() {
 		var show ShowProgress
-		err := rows.Scan(&show.Name, &show.Season, &show.Episode)
+		var providerShowID string
+		var notificationsEnabled int
+		err := rows.Scan(&show.Name, &show.Season, &show.Episode, &providerShowID, &notificationsEnabled)
 		if err != nil {
 			return nil, err
 		}
+		show.NotificationsEnabled = notificationsEnabled == 1
+
+		// Always check for next episode air date (if there's a future episode, the show is ongoing)
+		nextAirDate, err := findNextEpisodeAirDate(db, providerShowID, show.Season, show.Episode)
+		if err == nil {
+			show.NextAirDate = sql.NullTime{Time: nextAirDate, Valid: true}
+		}
+
 		shows = append(shows, show)
 	}
 	return shows, nil
@@ -268,6 +282,7 @@ func getDueReminders(db *sql.DB) ([]DBReminder, error) {
 		LEFT JOIN shows s ON s.id = r.show_id
 		LEFT JOIN episodes_cache e ON e.id = r.episode_id
 		WHERE r.remind_at <= DATETIME('now', '+5 minutes')
+		AND s.notifications_enabled = 1
 		`)
 	if err != nil {
 		return nil, err
@@ -357,6 +372,63 @@ func getEpisodesBySeason(db *sql.DB, providerShowID string, season int) ([]DBEpi
 	return episodes, nil
 }
 
+func findNextEpisodeAirDate(db *sql.DB, providerShowID string, lastSeason sql.NullInt32, lastEpisode sql.NullInt32) (time.Time, error) {
+	var nextEpisode DBEpisode
+	var airedAtStr string
+	var fetchedAtStr string
+
+	var season, episode int
+	if lastSeason.Valid && lastEpisode.Valid {
+		season = int(lastSeason.Int32)
+		episode = int(lastEpisode.Int32)
+	} else {
+		// If no progress, start from season 1 episode 1
+		season = 1
+		episode = 0
+	}
+
+	err := db.QueryRow(`
+		SELECT
+			id, provider, provider_show_id, provider_episode_id, season, number,
+			title, airdate, airtime, aired_at_utc, fetched_at
+		FROM episodes_cache
+		WHERE provider_show_id = ?
+		AND (
+			(season = ? AND number > ?) OR
+			(season > ?)
+		)
+		AND aired_at_utc > datetime('now')
+		ORDER BY season, number
+		LIMIT 1
+	`, providerShowID, season, episode, season).Scan(
+		&nextEpisode.ID, &nextEpisode.Provider, &nextEpisode.ProviderShowID, &nextEpisode.ProviderEpisodeID,
+		&nextEpisode.Season, &nextEpisode.Number, &nextEpisode.Title, &nextEpisode.Airdate, &nextEpisode.Airtime,
+		&airedAtStr, &fetchedAtStr,
+	)
+
+	if err == sql.ErrNoRows {
+		return time.Time{}, errors.New("no upcoming episode found")
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	if airedAtStr != "" {
+		return time.Parse(time.RFC3339, airedAtStr)
+	}
+
+	return time.Time{}, errors.New("no air date available")
+}
+
+func toggleShowNotifications(db *sql.DB, showID int64) error {
+	_, err := db.Exec(`
+		UPDATE shows
+		SET notifications_enabled = CASE WHEN notifications_enabled = 1 THEN 0 ELSE 1 END
+		WHERE id = ?
+	`, showID)
+	return err
+}
+
 func markReminderSent(db *sql.DB, reminder DBReminder) error {
 	tx, err := db.Begin()
 	if err != nil {
@@ -430,8 +502,14 @@ func markReminderSent(db *sql.DB, reminder DBReminder) error {
 		nextEpisode.FetchedAt, _ = time.Parse(time.RFC3339, fetchedAtStr)
 	}
 
-	// Create reminder for next episode if it has an air date
-	if !nextEpisode.AiredAtUTC.IsZero() {
+	// Create reminder for next episode if it has an air date and notifications are enabled
+	var notificationsEnabled bool
+	err = tx.QueryRow(`SELECT notifications_enabled FROM shows WHERE id = ?`, reminder.ShowID).Scan(&notificationsEnabled)
+	if err != nil {
+		return err
+	}
+
+	if !nextEpisode.AiredAtUTC.IsZero() && notificationsEnabled {
 		_, err = tx.Exec(`
 			INSERT INTO reminders (user_id, show_id, episode_id, remind_at, chat_id)
 			VALUES (?, ?, ?, ?, ?)

@@ -30,6 +30,7 @@ type UserContext struct {
 	SelectedInternalID int64
 	SelectedProviderID int
 	SelectedSeason     int
+	ShowsList          []ShowProgress
 }
 
 type Bot struct {
@@ -54,10 +55,9 @@ func main() {
 
 	// Set bot commands for menu
 	commands := []tgbotapi.BotCommand{
-		{Command: "start", Description: "Start the bot"},
-		{Command: "help", Description: "Show help information"},
 		{Command: "add", Description: "Add a TV show to track"},
 		{Command: "shows", Description: "List your tracked shows"},
+		{Command: "help", Description: "Show help information"},
 	}
 	if _, err := botApi.Request(tgbotapi.NewSetMyCommands(commands...)); err != nil {
 		log.Printf("Failed to set bot commands: %v", err)
@@ -115,7 +115,13 @@ func (bot *Bot) handleCommand(msg *tgbotapi.Message) {
 
 	switch command {
 	case "start":
-		bot.reply(chatID, "Hello! I'm TV Show Reminder.")
+		startText := dedent(`
+		Hello! I'm a bot that helps you track your TV shows and notify you when new episodes air.
+
+		/add - Add a TV show to track
+		/shows - List your tracked shows
+		`)
+		bot.reply(chatID, startText)
 	case "help":
 		helpText := dedent(`
 		Commands:
@@ -136,15 +142,29 @@ func (bot *Bot) handleCommand(msg *tgbotapi.Message) {
 		if len(shows) == 0 {
 			bot.reply(chatID, "You have no shows yet. Use /add <show> to add one.")
 		} else {
-			var showLines []string
-			for _, show := range shows {
-				if show.Season.Valid && show.Episode.Valid {
-					showLines = append(showLines, fmt.Sprintf("%s (S%dE%d)", show.Name, show.Season.Int32, show.Episode.Int32))
-				} else {
-					showLines = append(showLines, show.Name)
+			bot.withUserContext(msg.From.ID, func(ctx *UserContext) {
+				ctx.ShowsList = shows
+			})
+			var rows [][]tgbotapi.InlineKeyboardButton
+			for i, show := range shows {
+				line := show.Name
+				if show.NotificationsEnabled && show.NextAirDate.Valid {
+					line = "🔔 " + line
 				}
+				if show.Season.Valid && show.Episode.Valid {
+					line += fmt.Sprintf(" (S%02dE%02d)", show.Season.Int32, show.Episode.Int32)
+				}
+				if show.NextAirDate.Valid {
+					line += fmt.Sprintf(" - Next: %s", show.NextAirDate.Time.Format("Mon Jan 2, 15:04"))
+				}
+				cbData := fmt.Sprintf("selectShow:%d", i)
+				rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData(line, cbData)))
 			}
-			bot.reply(chatID, "Your shows:\n"+strings.Join(showLines, "\n"))
+			rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("❌ Cancel", "cancel")))
+			inlineMarkup := tgbotapi.NewInlineKeyboardMarkup(rows...)
+			m := tgbotapi.NewMessage(chatID, "Your shows:")
+			m.ReplyMarkup = inlineMarkup
+			bot.BotApi.Send(m)
 		}
 	default:
 		bot.reply(chatID, "Unknown command: /"+command)
@@ -171,6 +191,12 @@ func (bot *Bot) handleCallback(cb *tgbotapi.CallbackQuery) {
 		bot.handleSeasonCallback(cb, param)
 	case "selectEpisode":
 		bot.handleEpisodeCallback(cb, param)
+	case "selectShow":
+		bot.handleShowCallback(cb, param)
+	case "backToShows":
+		bot.handleBackToShowsCallback(cb)
+	case "toggleNotifications":
+		bot.handleToggleNotificationsCallback(cb, param)
 	case "cancel":
 		bot.handleCancelCallback(cb)
 	}
@@ -291,7 +317,7 @@ func (bot *Bot) searchAndSelectShow(query string, userID int64, chatID int64) {
 		max := min(5, len(results))
 
 		var rows [][]tgbotapi.InlineKeyboardButton
-		for i := 0; i < max; i++ {
+		for i := range max {
 			trimmed := trimString(results[i].Name, 25)
 			label := fmt.Sprintf("%d. %s (%s)", i+1, trimmed, safeString(results[i].Premiered))
 			cb := fmt.Sprintf("acceptShowName:%d", i+1)
@@ -426,7 +452,7 @@ func (bot *Bot) acceptShowNameCallback(cb *tgbotapi.CallbackQuery, param string)
 		editMsg.ReplyMarkup = &inlineMarkup
 		bot.BotApi.Send(editMsg)
 	}
-	cb_response := tgbotapi.NewCallback(cb.ID, cb.Data)
+	cb_response := tgbotapi.NewCallback(cb.ID, "")
 	bot.BotApi.Request(cb_response)
 }
 
@@ -557,7 +583,7 @@ func (bot *Bot) handleSeasonCallback(cb *tgbotapi.CallbackQuery, param string) {
 	editMsg.ReplyMarkup = &inlineMarkup
 	bot.BotApi.Send(editMsg)
 
-	cb_response := tgbotapi.NewCallback(cb.ID, cb.Data)
+	cb_response := tgbotapi.NewCallback(cb.ID, "")
 	bot.BotApi.Request(cb_response)
 }
 
@@ -643,7 +669,7 @@ func (bot *Bot) handleEpisodeCallback(cb *tgbotapi.CallbackQuery, param string) 
 
 	bot.clearState(userID)
 
-	cb_response := tgbotapi.NewCallback(cb.ID, cb.Data)
+	cb_response := tgbotapi.NewCallback(cb.ID, "")
 	bot.BotApi.Request(cb_response)
 }
 
@@ -656,7 +682,158 @@ func (bot *Bot) handleCancelCallback(cb *tgbotapi.CallbackQuery) {
 	editMsg.ReplyMarkup = nil
 	bot.BotApi.Send(editMsg)
 
-	cb_response := tgbotapi.NewCallback(cb.ID, cb.Data)
+	cb_response := tgbotapi.NewCallback(cb.ID, "")
+	bot.BotApi.Request(cb_response)
+}
+
+func (bot *Bot) handleToggleNotificationsCallback(cb *tgbotapi.CallbackQuery, param string) {
+	idx, err := strconv.Atoi(param)
+	if err != nil {
+		log.Printf("handleToggleNotificationsCallback: invalid parameter: %s", param)
+		return
+	}
+
+	userID := cb.From.ID
+	msg := cb.Message
+
+	userCtx := bot.getUserContext(userID)
+	if userCtx == nil || len(userCtx.ShowsList) == 0 {
+		bot.reply(msg.Chat.ID, "No shows found. Please start over with /shows")
+		bot.clearState(userID)
+		return
+	}
+
+	if idx < 0 || idx >= len(userCtx.ShowsList) {
+		bot.reply(msg.Chat.ID, "Invalid show selection.")
+		return
+	}
+
+	show := userCtx.ShowsList[idx]
+
+	// Get the show ID from the database
+	var showID int64
+	err = bot.DB.QueryRow(`
+		SELECT id FROM shows
+		WHERE user_id = ? AND name = ?
+	`, userID, show.Name).Scan(&showID)
+	if err != nil {
+		bot.reply(msg.Chat.ID, "Error toggling notifications")
+		return
+	}
+
+	err = toggleShowNotifications(bot.DB, showID)
+	if err != nil {
+		bot.reply(msg.Chat.ID, "Error toggling notifications")
+		return
+	}
+
+	// Refresh the shows list
+	shows, err := listShowsWithProgress(bot.DB, userID)
+	if err != nil {
+		bot.reply(msg.Chat.ID, "Error refreshing shows list")
+		return
+	}
+	userCtx.ShowsList = shows
+
+	// Re-show the show details
+	bot.handleShowCallback(cb, param)
+}
+
+func (bot *Bot) handleBackToShowsCallback(cb *tgbotapi.CallbackQuery) {
+	userID := cb.From.ID
+	msg := cb.Message
+
+	userCtx := bot.getUserContext(userID)
+	if userCtx == nil || len(userCtx.ShowsList) == 0 {
+		bot.reply(msg.Chat.ID, "No shows found. Please start over with /shows")
+		bot.clearState(userID)
+		return
+	}
+
+	shows := userCtx.ShowsList
+	var rows [][]tgbotapi.InlineKeyboardButton
+	for i, show := range shows {
+		line := show.Name
+		if show.NotificationsEnabled && show.NextAirDate.Valid {
+			line = "🔔 " + line
+		}
+		if show.Season.Valid && show.Episode.Valid {
+			line += fmt.Sprintf(" (S%02dE%02d)", show.Season.Int32, show.Episode.Int32)
+		}
+		if show.NextAirDate.Valid {
+			line += fmt.Sprintf(" - Next: %s", show.NextAirDate.Time.Format("Mon Jan 2, 15:04"))
+		}
+		cbData := fmt.Sprintf("selectShow:%d", i)
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData(line, cbData)))
+	}
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("❌ Cancel", "cancel")))
+	inlineMarkup := tgbotapi.NewInlineKeyboardMarkup(rows...)
+
+	editMsg := tgbotapi.NewEditMessageText(msg.Chat.ID, msg.MessageID, "Your shows:")
+	editMsg.ReplyMarkup = &inlineMarkup
+	bot.BotApi.Send(editMsg)
+
+	cb_response := tgbotapi.NewCallback(cb.ID, "")
+	bot.BotApi.Request(cb_response)
+}
+
+func (bot *Bot) handleShowCallback(cb *tgbotapi.CallbackQuery, param string) {
+	idx, err := strconv.Atoi(param)
+	if err != nil {
+		log.Printf("handleShowCallback: invalid parameter: %s", param)
+		return
+	}
+
+	userID := cb.From.ID
+	msg := cb.Message
+
+	userCtx := bot.getUserContext(userID)
+	if userCtx == nil || len(userCtx.ShowsList) == 0 {
+		bot.reply(msg.Chat.ID, "No shows found. Please start over with /shows")
+		bot.clearState(userID)
+		return
+	}
+
+	if idx < 0 || idx >= len(userCtx.ShowsList) {
+		bot.reply(msg.Chat.ID, "Invalid show selection.")
+		return
+	}
+
+	show := userCtx.ShowsList[idx]
+
+	var infoText string
+	infoText += fmt.Sprintf("<b>%s</b>\n\n", show.Name)
+	if show.Season.Valid && show.Episode.Valid {
+		infoText += fmt.Sprintf("Current episode: S%02dE%02d\n", show.Season.Int32, show.Episode.Int32)
+	} else {
+		infoText += "Current episode: Not set\n"
+	}
+	if show.NextAirDate.Valid {
+		infoText += fmt.Sprintf("Next episode air date: %s\n", show.NextAirDate.Time.Format("Mon Jan 2, 15:04"))
+	} else {
+		infoText += "Next episode air date: N/A\n"
+	}
+	notificationsStatus := "Enabled"
+	if !show.NotificationsEnabled {
+		notificationsStatus = "Disabled"
+	}
+	infoText += fmt.Sprintf("Notifications: %s\n", notificationsStatus)
+
+	var rows [][]tgbotapi.InlineKeyboardButton
+	toggleText := "Disable Notifications"
+	if !show.NotificationsEnabled {
+		toggleText = "Enable Notifications"
+	}
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData(toggleText, fmt.Sprintf("toggleNotifications:%d", idx))))
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("<< Back to shows list", "backToShows")))
+	inlineMarkup := tgbotapi.NewInlineKeyboardMarkup(rows...)
+
+	editMsg := tgbotapi.NewEditMessageText(msg.Chat.ID, msg.MessageID, infoText)
+	editMsg.ReplyMarkup = &inlineMarkup
+	editMsg.ParseMode = "HTML"
+	bot.BotApi.Send(editMsg)
+
+	cb_response := tgbotapi.NewCallback(cb.ID, "")
 	bot.BotApi.Request(cb_response)
 }
 
