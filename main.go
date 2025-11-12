@@ -451,7 +451,7 @@ func (handler *Handler) acceptSeasonEpisode(msg *tgbotapi.Message) {
 			handler.Bot.reply(chatID, "Failed to get show name")
 			return
 		}
-		handler.Bot.reply(chatID, fmt.Sprintf("\"%s\" added. Marked as watched up to S%02dE%02d.", showName, season, number))
+		handler.Bot.reply(chatID, fmt.Sprintf("Marked \"%s\" as watched up to S%02dE%02d.", showName, season, number))
 		return
 	}
 
@@ -481,7 +481,7 @@ func (handler *Handler) acceptSeasonEpisode(msg *tgbotapi.Message) {
 		handler.Bot.reply(
 			chatID,
 			fmt.Sprintf(
-				"\"%s\" added. Marked as watched up to S%02dE%02d. Next episode \"%s\" is expected to air on %s. I'll notify you when it airs.",
+				"Marked \"%s\" as watched up to S%02dE%02d. Next episode \"%s\" is expected to air on %s. I'll notify you when it airs.",
 				showName, season, number, nextEpisode.Title, nextEpisode.AiredAtUTC.Format("Mon Jan 2, 15:04"),
 			))
 	} else {
@@ -498,7 +498,7 @@ func (handler *Handler) acceptSeasonEpisode(msg *tgbotapi.Message) {
 			handler.Bot.reply(chatID, "Failed to get show name")
 			return
 		}
-		handler.Bot.reply(chatID, fmt.Sprintf("\"%s\" added. Marked as watched up to S%02dE%02d.", showName, season, number))
+		handler.Bot.reply(chatID, fmt.Sprintf("Marked \"%s\" as watched up to S%02dE%02d.", showName, season, number))
 	}
 }
 
@@ -594,7 +594,7 @@ func (handler *Handler) handleEpisodeCallback(cb *tgbotapi.CallbackQuery, param 
 			if err != nil {
 				resultText = "Failed to get show name"
 			} else {
-				resultText = fmt.Sprintf("\"%s\" added. Marked as watched up to S%02dE%02d.", showName, season, episodeNumber)
+				resultText = fmt.Sprintf("Marked \"%s\" as watched up to S%02dE%02d.", showName, season, episodeNumber)
 			}
 		}
 	} else {
@@ -619,7 +619,7 @@ func (handler *Handler) handleEpisodeCallback(cb *tgbotapi.CallbackQuery, param 
 						resultText = "Failed to get show name"
 					} else {
 						resultText = fmt.Sprintf(
-							"\"%s\" added. Marked as watched up to S%02dE%02d. Next episode \"%s\" is expected to air on %s. I'll notify you when it airs.",
+							"Marked \"%s\" as watched up to S%02dE%02d. Next episode \"%s\" is expected to air on %s. I'll notify you when it airs.",
 							showName, season, episodeNumber, nextEpisode.Title, nextEpisode.AiredAtUTC.Format("Mon Jan 2, 15:04"),
 						)
 					}
@@ -637,7 +637,7 @@ func (handler *Handler) handleEpisodeCallback(cb *tgbotapi.CallbackQuery, param 
 				if err != nil {
 					resultText = "Failed to get show name"
 				} else {
-					resultText = fmt.Sprintf("\"%s\" added. Marked as watched up to S%02dE%02d.", showName, season, episodeNumber)
+					resultText = fmt.Sprintf("Marked \"%s\" as watched up to S%02dE%02d.", showName, season, episodeNumber)
 				}
 			}
 		}
