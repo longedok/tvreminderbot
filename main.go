@@ -91,45 +91,6 @@ func main() {
 	}
 }
 
-func reminderLoop(bot *Bot, db *sql.DB, ctx context.Context) {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			reminders, err := getDueReminders(db)
-			if err != nil {
-				log.Printf("reminderLoop: getDueReminders error: %v", err)
-				continue
-			}
-			if len(reminders) != 0 {
-				log.Printf("reminderLoop: %d reminders due", len(reminders))
-			}
-			for _, r := range reminders {
-				log.Printf(
-					"reminderLoop: sending reminder chat=%d show=%q episode=%d title=%q",
-					r.ChatID, r.ShowName, r.EpisodeNumber, r.EpisodeTitle,
-				)
-				bot.reply(
-					r.ChatID,
-					fmt.Sprintf(
-						"Episode #%d \"%s\" of \"%s\" (season %d) is coming out today!",
-						r.EpisodeNumber, r.EpisodeTitle, r.ShowName, r.EpisodeSeason,
-					),
-				)
-
-				if err := markReminderSent(db, r); err != nil {
-					log.Printf("reminderLoop: failed to mark reminder sent: %v", err)
-				}
-			}
-		case <-ctx.Done():
-			log.Println("reminderLoop: context cancelled, exiting")
-			return
-		}
-	}
-}
-
 func (handler *Handler) handleCommand(msg *tgbotapi.Message) {
 	chatID := msg.Chat.ID
 	command := msg.Command()
@@ -445,13 +406,13 @@ func (handler *Handler) acceptSeasonEpisode(msg *tgbotapi.Message) {
 			return
 		}
 		// Get show name from database
-		var showName string
-		err = handler.DB.QueryRow(`SELECT name FROM shows WHERE id = ?`, userCtx.SelectedInternalID).Scan(&showName)
+		showName, err := getShowNameByID(handler.DB, userCtx.SelectedInternalID)
 		if err != nil {
 			handler.Bot.reply(chatID, "Failed to get show name")
 			return
 		}
 		handler.Bot.reply(chatID, fmt.Sprintf("Marked \"%s\" as watched up to S%02dE%02d.", showName, season, number))
+		handler.Bot.clearState(userID)
 		return
 	}
 
@@ -472,8 +433,7 @@ func (handler *Handler) acceptSeasonEpisode(msg *tgbotapi.Message) {
 			return
 		}
 		// Get show name from database
-		var showName string
-		err = handler.DB.QueryRow(`SELECT name FROM shows WHERE id = ?`, userCtx.SelectedInternalID).Scan(&showName)
+		showName, err := getShowNameByID(handler.DB, userCtx.SelectedInternalID)
 		if err != nil {
 			handler.Bot.reply(chatID, "Failed to get show name")
 			return
@@ -484,6 +444,7 @@ func (handler *Handler) acceptSeasonEpisode(msg *tgbotapi.Message) {
 				"Marked \"%s\" as watched up to S%02dE%02d. Next episode \"%s\" is expected to air on %s. I'll notify you when it airs.",
 				showName, season, number, nextEpisode.Title, nextEpisode.AiredAtUTC.Format("Mon Jan 2, 15:04"),
 			))
+		handler.Bot.clearState(userID)
 	} else {
 		// Next episode has already aired or no air date, record current episode as last watched
 		err = updateLastWatchedEpisode(handler.DB, userCtx.SelectedInternalID, currentEpisode.ID)
@@ -492,8 +453,7 @@ func (handler *Handler) acceptSeasonEpisode(msg *tgbotapi.Message) {
 			return
 		}
 		// Get show name from database
-		var showName string
-		err = handler.DB.QueryRow(`SELECT name FROM shows WHERE id = ?`, userCtx.SelectedInternalID).Scan(&showName)
+		showName, err := getShowNameByID(handler.DB, userCtx.SelectedInternalID)
 		if err != nil {
 			handler.Bot.reply(chatID, "Failed to get show name")
 			return
@@ -589,8 +549,7 @@ func (handler *Handler) handleEpisodeCallback(cb *tgbotapi.CallbackQuery, param 
 			resultText = "Failed to update progress"
 		} else {
 			// Get show name from database
-			var showName string
-			err = handler.DB.QueryRow(`SELECT name FROM shows WHERE id = ?`, userCtx.SelectedInternalID).Scan(&showName)
+			showName, err := getShowNameByID(handler.DB, userCtx.SelectedInternalID)
 			if err != nil {
 				resultText = "Failed to get show name"
 			} else {
@@ -613,8 +572,7 @@ func (handler *Handler) handleEpisodeCallback(cb *tgbotapi.CallbackQuery, param 
 					resultText = "Failed to create reminder"
 				} else {
 					// Get show name from database
-					var showName string
-					err = handler.DB.QueryRow(`SELECT name FROM shows WHERE id = ?`, userCtx.SelectedInternalID).Scan(&showName)
+					showName, err := getShowNameByID(handler.DB, userCtx.SelectedInternalID)
 					if err != nil {
 						resultText = "Failed to get show name"
 					} else {
@@ -632,8 +590,7 @@ func (handler *Handler) handleEpisodeCallback(cb *tgbotapi.CallbackQuery, param 
 				resultText = "Failed to update progress"
 			} else {
 				// Get show name from database
-				var showName string
-				err = handler.DB.QueryRow(`SELECT name FROM shows WHERE id = ?`, userCtx.SelectedInternalID).Scan(&showName)
+				showName, err := getShowNameByID(handler.DB, userCtx.SelectedInternalID)
 				if err != nil {
 					resultText = "Failed to get show name"
 				} else {
@@ -688,11 +645,7 @@ func (handler *Handler) handleToggleNotificationsCallback(cb *tgbotapi.CallbackQ
 	show := userCtx.ShowsList[idx]
 
 	// Get the show ID from the database
-	var showID int64
-	err = handler.DB.QueryRow(`
-		SELECT id FROM shows
-		WHERE user_id = ? AND name = ?
-	`, userID, show.Name).Scan(&showID)
+	showID, _, err := getShowByUserAndName(handler.DB, userID, show.Name)
 	if err != nil {
 		handler.Bot.reply(msg.Chat.ID, "Error toggling notifications")
 		return
@@ -741,12 +694,7 @@ func (handler *Handler) handleMarkNextWatchedCallback(cb *tgbotapi.CallbackQuery
 	show := userCtx.ShowsList[idx]
 
 	// Get the show ID and provider_show_id from the database
-	var showID int64
-	var providerShowID string
-	err = handler.DB.QueryRow(`
-		SELECT id, provider_show_id FROM shows
-		WHERE user_id = ? AND name = ?
-	`, userID, show.Name).Scan(&showID, &providerShowID)
+	showID, providerShowID, err := getShowByUserAndName(handler.DB, userID, show.Name)
 	if err != nil {
 		handler.Bot.reply(msg.Chat.ID, "Error finding show")
 		return
