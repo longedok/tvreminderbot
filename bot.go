@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"log"
 	"sync"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -33,9 +34,56 @@ type Bot struct {
 }
 
 type ReplyOptions struct {
-	ReplyMarkup   interface{} // e.g., *tgbotapi.InlineKeyboardMarkup or *tgbotapi.ReplyKeyboardMarkup
-	ParseMode     string      // "HTML", "Markdown", etc.
-	EditMessageID int         // message ID to edit; if 0, send new message
+	ReplyMarkup   any
+	ParseMode     string
+	EditMessageID int
+}
+
+func (bot *Bot) setCommands() {
+	commands := []tgbotapi.BotCommand{
+		{Command: "add", Description: "Add a TV show to track"},
+		{Command: "shows", Description: "List your tracked shows"},
+		{Command: "help", Description: "Show help information"},
+	}
+	if _, err := bot.BotApi.Request(tgbotapi.NewSetMyCommands(commands...)); err != nil {
+		log.Printf("Failed to set bot commands: %v", err)
+	}
+}
+
+func (bot *Bot) reply(chatID int64, text string, opts ...ReplyOptions) {
+	var opt ReplyOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+
+	if opt.EditMessageID != 0 {
+		editMsg := tgbotapi.NewEditMessageText(chatID, opt.EditMessageID, text)
+		if opt.ReplyMarkup != nil {
+			if markup, ok := opt.ReplyMarkup.(*tgbotapi.InlineKeyboardMarkup); ok {
+				editMsg.ReplyMarkup = markup
+			}
+		}
+		if opt.ParseMode != "" {
+			editMsg.ParseMode = opt.ParseMode
+		}
+		bot.BotApi.Send(editMsg)
+	} else {
+		message := tgbotapi.NewMessage(chatID, text)
+		if opt.ReplyMarkup != nil {
+			if markup, ok := opt.ReplyMarkup.(*tgbotapi.InlineKeyboardMarkup); ok {
+				message.ReplyMarkup = markup
+			}
+		}
+		if opt.ParseMode != "" {
+			message.ParseMode = opt.ParseMode
+		}
+		bot.BotApi.Send(message)
+	}
+}
+
+func (bot *Bot) answerCallbackQuery(callbackQueryID string) (*tgbotapi.APIResponse, error) {
+	cb_response := tgbotapi.NewCallback(callbackQueryID, "")
+	return bot.BotApi.Request(cb_response)
 }
 
 func (bot *Bot) withUserContext(userID int64, fn func(*UserContext)) {
@@ -71,35 +119,4 @@ func (bot *Bot) clearState(userID int64) {
 	bot.mu.Lock()
 	defer bot.mu.Unlock()
 	delete(bot.UserContexts, userID)
-}
-
-func (bot *Bot) reply(chatID int64, text string, opts ...ReplyOptions) {
-	var opt ReplyOptions
-	if len(opts) > 0 {
-		opt = opts[0]
-	}
-
-	if opt.EditMessageID != 0 {
-		editMsg := tgbotapi.NewEditMessageText(chatID, opt.EditMessageID, text)
-		if opt.ReplyMarkup != nil {
-			if markup, ok := opt.ReplyMarkup.(*tgbotapi.InlineKeyboardMarkup); ok {
-				editMsg.ReplyMarkup = markup
-			}
-		}
-		if opt.ParseMode != "" {
-			editMsg.ParseMode = opt.ParseMode
-		}
-		bot.BotApi.Send(editMsg)
-	} else {
-		message := tgbotapi.NewMessage(chatID, text)
-		if opt.ReplyMarkup != nil {
-			if markup, ok := opt.ReplyMarkup.(*tgbotapi.InlineKeyboardMarkup); ok {
-				message.ReplyMarkup = markup
-			}
-		}
-		if opt.ParseMode != "" {
-			message.ParseMode = opt.ParseMode
-		}
-		bot.BotApi.Send(message)
-	}
 }

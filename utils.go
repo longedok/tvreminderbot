@@ -3,7 +3,22 @@ package main
 import (
 	"strings"
 	"unicode/utf8"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
+
+func makeKeyboardMarkup(rows [][][]string) *tgbotapi.InlineKeyboardMarkup {
+	var inlineRows [][]tgbotapi.InlineKeyboardButton
+	for _, row := range rows {
+		var inlineRow []tgbotapi.InlineKeyboardButton
+		for _, button := range row {
+			inlineRow = append(inlineRow, tgbotapi.NewInlineKeyboardButtonData(button[0], button[1]))
+		}
+		inlineRows = append(inlineRows, inlineRow)
+	}
+	inlineMarkup := tgbotapi.NewInlineKeyboardMarkup(inlineRows...)
+	return &inlineMarkup
+}
 
 func safeString(s *string) string {
 	if s == nil {
