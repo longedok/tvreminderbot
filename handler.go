@@ -418,7 +418,7 @@ func (handler *Handler) handleShowsCommand(msg *tgbotapi.Message) {
 	handler.Bot.withUserContext(msg.From.ID, func(ctx *UserContext) {
 		ctx.ShowsList = shows
 	})
-	var rows [][]tgbotapi.InlineKeyboardButton
+	var rows [][][]string
 	for i, show := range shows {
 		line := show.Name
 		if show.NotificationsEnabled && show.NextAirDate.Valid {
@@ -435,10 +435,10 @@ func (handler *Handler) handleShowsCommand(msg *tgbotapi.Message) {
 			}
 		}
 		cbData := fmt.Sprintf("selectShow:%d", i)
-		rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData(line, cbData)))
+		rows = append(rows, [][]string{{line, cbData}})
 	}
-	inlineMarkup := tgbotapi.NewInlineKeyboardMarkup(rows...)
-	handler.Bot.reply(chatID, "Your shows:", ReplyOptions{ReplyMarkup: &inlineMarkup})
+	inlineMarkup := makeKeyboardMarkup(rows)
+	handler.Bot.reply(chatID, "Your shows:", ReplyOptions{ReplyMarkup: inlineMarkup})
 }
 
 func (handler *Handler) handleShowCallback(cb *tgbotapi.CallbackQuery, param string) {
@@ -620,7 +620,7 @@ func (handler *Handler) handleBackToShowsCallback(cb *tgbotapi.CallbackQuery) {
 	}
 
 	shows := userCtx.ShowsList
-	var rows [][]tgbotapi.InlineKeyboardButton
+	var rows [][][]string
 	for i, show := range shows {
 		line := show.Name
 		if show.NotificationsEnabled && show.NextAirDate.Valid {
@@ -637,12 +637,12 @@ func (handler *Handler) handleBackToShowsCallback(cb *tgbotapi.CallbackQuery) {
 			}
 		}
 		cbData := fmt.Sprintf("selectShow:%d", i)
-		rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData(line, cbData)))
+		rows = append(rows, [][]string{{line, cbData}})
 	}
-	rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("❌ Cancel", "cancel")))
-	inlineMarkup := tgbotapi.NewInlineKeyboardMarkup(rows...)
+	rows = append(rows, [][]string{{"❌ Cancel", "cancel"}})
+	inlineMarkup := makeKeyboardMarkup(rows)
 
-	handler.Bot.reply(msg.Chat.ID, "Your shows:", ReplyOptions{ReplyMarkup: &inlineMarkup, EditMessageID: msg.MessageID})
+	handler.Bot.reply(msg.Chat.ID, "Your shows:", ReplyOptions{ReplyMarkup: inlineMarkup, EditMessageID: msg.MessageID})
 
 	cb_response := tgbotapi.NewCallback(cb.ID, "")
 	handler.Bot.BotApi.Request(cb_response)
