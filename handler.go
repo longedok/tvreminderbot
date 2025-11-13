@@ -418,10 +418,15 @@ func (handler *Handler) handleShowsCommand(msg *tgbotapi.Message) {
 	handler.Bot.withUserContext(msg.From.ID, func(ctx *UserContext) {
 		ctx.ShowsList = shows
 	})
+	inlineMarkup := handler.makeShowsKeyboard(shows)
+	handler.Bot.reply(chatID, "Your shows:", ReplyOptions{ReplyMarkup: inlineMarkup})
+}
+
+func (handler *Handler) makeShowsKeyboard(shows []ShowProgress) *tgbotapi.InlineKeyboardMarkup {
 	var rows [][][]string
 	for i, show := range shows {
 		line := show.Name
-		if show.NotificationsEnabled && show.NextAirDate.Valid {
+		if show.NotificationsEnabled && show.NextAirDate.Valid && show.NextAirDate.Time.After(time.Now()) {
 			line = "🔔 " + line
 		}
 		if show.Season.Valid && show.Episode.Valid {
@@ -429,16 +434,16 @@ func (handler *Handler) handleShowsCommand(msg *tgbotapi.Message) {
 		}
 		if show.NextEpisodeSeason.Valid && show.NextEpisodeNumber.Valid {
 			if show.NextAirDate.Valid && show.NextAirDate.Time.After(time.Now()) {
-				line += fmt.Sprintf(" - Next: %s", show.NextAirDate.Time.Format("Mon Jan 2, 15:04"))
+				line += fmt.Sprintf(" - Next Ep %s", show.NextAirDate.Time.Format("Jan 2 (Mon)"))
 			} else {
-				line += " - Next episode available!"
+				line += " - Next Ep Out ✅"
 			}
 		}
 		cbData := fmt.Sprintf("selectShow:%d", i)
 		rows = append(rows, [][]string{{line, cbData}})
 	}
-	inlineMarkup := makeKeyboardMarkup(rows)
-	handler.Bot.reply(chatID, "Your shows:", ReplyOptions{ReplyMarkup: inlineMarkup})
+
+	return makeKeyboardMarkup(rows)
 }
 
 func (handler *Handler) handleShowCallback(cb *tgbotapi.CallbackQuery, param string) {
@@ -620,32 +625,11 @@ func (handler *Handler) handleBackToShowsCallback(cb *tgbotapi.CallbackQuery) {
 	}
 
 	shows := userCtx.ShowsList
-	var rows [][][]string
-	for i, show := range shows {
-		line := show.Name
-		if show.NotificationsEnabled && show.NextAirDate.Valid {
-			line = "🔔 " + line
-		}
-		if show.Season.Valid && show.Episode.Valid {
-			line += fmt.Sprintf(" (S%02dE%02d)", show.Season.Int32, show.Episode.Int32)
-		}
-		if show.NextEpisodeSeason.Valid && show.NextEpisodeNumber.Valid {
-			if show.NextAirDate.Valid && show.NextAirDate.Time.After(time.Now()) {
-				line += fmt.Sprintf(" - Next: %s", show.NextAirDate.Time.Format("Mon Jan 2, 15:04"))
-			} else {
-				line += " - next episode is out"
-			}
-		}
-		cbData := fmt.Sprintf("selectShow:%d", i)
-		rows = append(rows, [][]string{{line, cbData}})
-	}
-	rows = append(rows, [][]string{{"❌ Cancel", "cancel"}})
-	inlineMarkup := makeKeyboardMarkup(rows)
+	inlineMarkup := handler.makeShowsKeyboard(shows)
 
 	handler.Bot.reply(msg.Chat.ID, "Your shows:", ReplyOptions{ReplyMarkup: inlineMarkup, EditMessageID: msg.MessageID})
 
-	cb_response := tgbotapi.NewCallback(cb.ID, "")
-	handler.Bot.BotApi.Request(cb_response)
+	handler.Bot.answerCallbackQuery(cb.ID)
 }
 
 // CANCEL command flow
