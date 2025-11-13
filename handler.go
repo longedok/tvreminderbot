@@ -58,7 +58,8 @@ func (handler *Handler) handleCommand(msg *tgbotapi.Message) {
 		Hello! I'm a bot that helps you track your TV shows and notify you when new episodes air.
 
 		/add - Add a TV show to track
-		/shows - List your tracked shows
+		/shows - List your current shows
+		/history - List all your shows
 		`)
 		handler.Bot.reply(chatID, startText)
 	case "help":
@@ -66,7 +67,8 @@ func (handler *Handler) handleCommand(msg *tgbotapi.Message) {
 		Commands:
 
 		/add <show>
-		/shows - list your shows
+		/shows - list your current shows
+		/history - list all your shows
 		/help - show this help
 		`)
 		handler.Bot.reply(chatID, helpText)
@@ -74,6 +76,8 @@ func (handler *Handler) handleCommand(msg *tgbotapi.Message) {
 		handler.handleAddCommand(msg)
 	case "shows":
 		handler.handleShowsCommand(msg)
+	case "history":
+		handler.handleHistoryCommand(msg)
 	default:
 		handler.Bot.reply(chatID, fmt.Sprintf("Unknown command: /%s. See /help for available commands.", command))
 	}
@@ -406,6 +410,24 @@ func (handler *Handler) handleEpisodeCallback(cb *tgbotapi.CallbackQuery, param 
 
 func (handler *Handler) handleShowsCommand(msg *tgbotapi.Message) {
 	chatID := msg.Chat.ID
+	shows, err := listCurrentShowsWithProgress(handler.DB, msg.From.ID)
+	if err != nil {
+		handler.Bot.reply(chatID, "Error: can't list shows at this time")
+		return
+	}
+	if len(shows) == 0 {
+		handler.Bot.reply(chatID, "You have no current shows. Use /add <show> to add one, or /history to see all shows.")
+		return
+	}
+	handler.Bot.withUserContext(msg.From.ID, func(ctx *UserContext) {
+		ctx.ShowsList = shows
+	})
+	inlineMarkup := handler.makeShowsKeyboard(shows)
+	handler.Bot.reply(chatID, "Your current shows:", ReplyOptions{ReplyMarkup: inlineMarkup})
+}
+
+func (handler *Handler) handleHistoryCommand(msg *tgbotapi.Message) {
+	chatID := msg.Chat.ID
 	shows, err := listShowsWithProgress(handler.DB, msg.From.ID)
 	if err != nil {
 		handler.Bot.reply(chatID, "Error: can't list shows at this time")
@@ -419,7 +441,7 @@ func (handler *Handler) handleShowsCommand(msg *tgbotapi.Message) {
 		ctx.ShowsList = shows
 	})
 	inlineMarkup := handler.makeShowsKeyboard(shows)
-	handler.Bot.reply(chatID, "Your shows:", ReplyOptions{ReplyMarkup: inlineMarkup})
+	handler.Bot.reply(chatID, "Your show history:", ReplyOptions{ReplyMarkup: inlineMarkup})
 }
 
 func (handler *Handler) makeShowsKeyboard(shows []ShowProgress) *tgbotapi.InlineKeyboardMarkup {

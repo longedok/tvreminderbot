@@ -3,7 +3,6 @@ package main
 import (
 	"database/sql"
 	"errors"
-	"sort"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -155,24 +154,6 @@ func addShow(db *sql.DB, userID int64, name, provider string, showID int) (int64
 	return internalID, nil
 }
 
-func listShows(db *sql.DB, userID int64) ([]string, error) {
-	rows, err := db.Query(`SELECT name FROM shows WHERE user_id = ?`, userID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var shows []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, err
-		}
-		shows = append(shows, name)
-	}
-	return shows, nil
-}
-
 func listShowsWithProgress(db *sql.DB, userID int64) ([]ShowProgress, error) {
 	rows, err := db.Query(`
 		SELECT s.name, e.season, e.number, s.provider_show_id, s.notifications_enabled
@@ -211,28 +192,23 @@ func listShowsWithProgress(db *sql.DB, userID int64) ([]ShowProgress, error) {
 		shows = append(shows, show)
 	}
 
-	getStatus := func(show ShowProgress) int {
+	return shows, nil
+}
+
+func listCurrentShowsWithProgress(db *sql.DB, userID int64) ([]ShowProgress, error) {
+	shows, err := listShowsWithProgress(db, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	var currentShows []ShowProgress
+	for _, show := range shows {
 		if show.NextEpisodeSeason.Valid {
-			if show.NextAirDate.Valid && show.NextAirDate.Time.After(time.Now()) {
-				return 0 // ongoing
-			} else {
-				return 1 // watching (fully released)
-			}
-		} else {
-			return 2 // finished
+			currentShows = append(currentShows, show)
 		}
 	}
 
-	sort.Slice(shows, func(i, j int) bool {
-		statusI := getStatus(shows[i])
-		statusJ := getStatus(shows[j])
-		if statusI != statusJ {
-			return statusI < statusJ
-		}
-		return shows[i].Name < shows[j].Name
-	})
-
-	return shows, nil
+	return currentShows, nil
 }
 
 func upsertEpisode(
