@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"errors"
+	"sort"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -209,6 +210,28 @@ func listShowsWithProgress(db *sql.DB, userID int64) ([]ShowProgress, error) {
 
 		shows = append(shows, show)
 	}
+
+	getStatus := func(show ShowProgress) int {
+		if show.NextEpisodeSeason.Valid {
+			if show.NextAirDate.Valid && show.NextAirDate.Time.After(time.Now()) {
+				return 0 // ongoing
+			} else {
+				return 1 // watching (fully released)
+			}
+		} else {
+			return 2 // finished
+		}
+	}
+
+	sort.Slice(shows, func(i, j int) bool {
+		statusI := getStatus(shows[i])
+		statusJ := getStatus(shows[j])
+		if statusI != statusJ {
+			return statusI < statusJ
+		}
+		return shows[i].Name < shows[j].Name
+	})
+
 	return shows, nil
 }
 
