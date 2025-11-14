@@ -54,24 +54,9 @@ func (handler *Handler) handleCommand(msg *tgbotapi.Message) {
 
 	switch command {
 	case "start":
-		startText := dedent(`
-		Hello! I'm a bot that helps you track your TV shows and notify you when new episodes air.
-
-		/add - Add a TV show to track
-		/shows - List your current shows
-		/history - List all your shows
-		`)
-		handler.Bot.reply(chatID, startText)
+		handler.handleStartCommand(msg)
 	case "help":
-		helpText := dedent(`
-		Commands:
-
-		/add <show>
-		/shows - list your current shows
-		/history - list all your shows
-		/help - show this help
-		`)
-		handler.Bot.reply(chatID, helpText)
+		handler.handleHelpCommand(msg)
 	case "add":
 		handler.handleAddCommand(msg)
 	case "shows":
@@ -81,6 +66,31 @@ func (handler *Handler) handleCommand(msg *tgbotapi.Message) {
 	default:
 		handler.Bot.reply(chatID, fmt.Sprintf("Unknown command: /%s. See /help for available commands.", command))
 	}
+}
+
+func (handler *Handler) handleStartCommand(msg *tgbotapi.Message) {
+	chatID := msg.Chat.ID
+	startText := dedent(`
+	Hello! I'm a bot that helps you track your TV shows and notify you when new episodes air.
+
+	/add - Add a TV show to track
+	/shows - List your current shows
+	/history - List all your shows
+	`)
+	handler.Bot.reply(chatID, startText)
+}
+
+func (handler *Handler) handleHelpCommand(msg *tgbotapi.Message) {
+	chatID := msg.Chat.ID
+	helpText := dedent(`
+	Commands:
+
+	/add <show>
+	/shows - list your current shows
+	/history - list all your shows
+	/help - show this help
+	`)
+	handler.Bot.reply(chatID, helpText)
 }
 
 func (handler *Handler) handleCallback(cb *tgbotapi.CallbackQuery) {
