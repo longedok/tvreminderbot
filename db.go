@@ -123,6 +123,8 @@ func openDB() (*sql.DB, error) {
 	return db, nil
 }
 
+// Shows
+
 func addShow(db *sql.DB, userID int64, name, provider string, showID int) (int64, error) {
 	result, err := db.Exec(`
 		INSERT INTO shows (user_id, name, provider, provider_show_id)
@@ -211,6 +213,36 @@ func listCurrentShowsWithProgress(db *sql.DB, userID int64) ([]ShowProgress, err
 	return currentShows, nil
 }
 
+func getShowByUserAndName(db *sql.DB, userID int64, name string) (int64, string, error) {
+	var showID int64
+	var providerShowID string
+	err := db.QueryRow(`
+		SELECT id, provider_show_id FROM shows
+		WHERE user_id = ? AND name = ?
+	`, userID, name).Scan(&showID, &providerShowID)
+	if err != nil {
+		return 0, "", err
+	}
+	return showID, providerShowID, nil
+}
+
+func getShowNameByID(db *sql.DB, showID int64) (string, error) {
+	var name string
+	err := db.QueryRow(`SELECT name FROM shows WHERE id = ?`, showID).Scan(&name)
+	return name, err
+}
+
+func toggleShowNotifications(db *sql.DB, showID int64) error {
+	_, err := db.Exec(`
+		UPDATE shows
+		SET notifications_enabled = CASE WHEN notifications_enabled = 1 THEN 0 ELSE 1 END
+		WHERE id = ?
+	`, showID)
+	return err
+}
+
+// Episodes & Seasons
+
 func upsertEpisode(
 	db *sql.DB,
 	provider, showID, episodeID, title string,
@@ -268,46 +300,6 @@ func findEpisodeByNumber(db *sql.DB, providerShowId string, season, number int) 
 	}
 
 	return &episode, nil
-}
-
-func createReminder(db *sql.DB, userID int64, showID int, episodeID int64, remindAt time.Time, chatID int64) error {
-	_, err := db.Exec(`
-		INSERT INTO reminders (user_id, show_id, episode_id, remind_at, chat_id)
-		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT DO NOTHING
-	`, userID, showID, episodeID, remindAt, chatID)
-
-	return err
-}
-
-func getDueReminders(db *sql.DB) ([]DBReminder, error) {
-	rows, err := db.Query(`
-		SELECT
-			r.id, r.user_id, r.show_id, r.episode_id, r.remind_at, r.chat_id,
-			s.name, e.title, e.number, e.season
-		FROM reminders r
-		LEFT JOIN shows s ON s.id = r.show_id
-		LEFT JOIN episodes_cache e ON e.id = r.episode_id
-		WHERE r.remind_at <= DATETIME('now', '+5 minutes')
-		AND s.notifications_enabled = 1
-		`)
-	if err != nil {
-		return nil, err
-	}
-	var reminders []DBReminder
-	for rows.Next() {
-		var reminder DBReminder
-		if err := rows.Scan(
-			&reminder.ID, &reminder.UserID, &reminder.ShowID, &reminder.EpisodeID,
-			&reminder.RemindAt, &reminder.ChatID, &reminder.ShowName,
-			&reminder.EpisodeTitle, &reminder.EpisodeNumber, &reminder.EpisodeSeason,
-		); err != nil {
-			return nil, err
-		}
-		reminders = append(reminders, reminder)
-	}
-
-	return reminders, nil
 }
 
 func updateLastWatchedEpisode(db *sql.DB, showID int64, episodeID int64) error {
@@ -379,22 +371,16 @@ func getEpisodesBySeason(db *sql.DB, providerShowID string, season int) ([]DBEpi
 	return episodes, nil
 }
 
-func findNextEpisode(db *sql.DB, providerShowID string, lastSeason sql.NullInt32, lastEpisode sql.NullInt32) (*DBEpisode, error) {
+type Querier interface {
+	QueryRow(query string, args ...interface{}) *sql.Row
+}
+
+func findNextEpisodeByProviderID(q Querier, providerShowID string, season, episode int) (*DBEpisode, error) {
 	var nextEpisode DBEpisode
 	var airedAtStr string
 	var fetchedAtStr string
 
-	var season, episode int
-	if lastSeason.Valid && lastEpisode.Valid {
-		season = int(lastSeason.Int32)
-		episode = int(lastEpisode.Int32)
-	} else {
-		// If no progress, start from season 1 episode 1
-		season = 1
-		episode = 0
-	}
-
-	err := db.QueryRow(`
+	err := q.QueryRow(`
 		SELECT
 			id, provider, provider_show_id, provider_episode_id, season, number,
 			title, airdate, airtime, aired_at_utc, fetched_at
@@ -429,32 +415,60 @@ func findNextEpisode(db *sql.DB, providerShowID string, lastSeason sql.NullInt32
 	return &nextEpisode, nil
 }
 
-func toggleShowNotifications(db *sql.DB, showID int64) error {
+func findNextEpisode(db *sql.DB, providerShowID string, lastSeason sql.NullInt32, lastEpisode sql.NullInt32) (*DBEpisode, error) {
+	var season, episode int
+	if lastSeason.Valid && lastEpisode.Valid {
+		season = int(lastSeason.Int32)
+		episode = int(lastEpisode.Int32)
+	} else {
+		// If no progress, start from season 1 episode 1
+		season = 1
+		episode = 0
+	}
+
+	return findNextEpisodeByProviderID(db, providerShowID, season, episode)
+}
+
+// Reminders
+
+func createReminder(db *sql.DB, userID int64, showID int, episodeID int64, remindAt time.Time, chatID int64) error {
 	_, err := db.Exec(`
-		UPDATE shows
-		SET notifications_enabled = CASE WHEN notifications_enabled = 1 THEN 0 ELSE 1 END
-		WHERE id = ?
-	`, showID)
+		INSERT INTO reminders (user_id, show_id, episode_id, remind_at, chat_id)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT DO NOTHING
+	`, userID, showID, episodeID, remindAt, chatID)
+
 	return err
 }
 
-func getShowByUserAndName(db *sql.DB, userID int64, name string) (int64, string, error) {
-	var showID int64
-	var providerShowID string
-	err := db.QueryRow(`
-		SELECT id, provider_show_id FROM shows
-		WHERE user_id = ? AND name = ?
-	`, userID, name).Scan(&showID, &providerShowID)
+func getDueReminders(db *sql.DB) ([]DBReminder, error) {
+	rows, err := db.Query(`
+		SELECT
+			r.id, r.user_id, r.show_id, r.episode_id, r.remind_at, r.chat_id,
+			s.name, e.title, e.number, e.season
+		FROM reminders r
+		LEFT JOIN shows s ON s.id = r.show_id
+		LEFT JOIN episodes_cache e ON e.id = r.episode_id
+		WHERE r.remind_at <= DATETIME('now', '+5 minutes')
+		AND s.notifications_enabled = 1
+		`)
 	if err != nil {
-		return 0, "", err
+		return nil, err
 	}
-	return showID, providerShowID, nil
-}
+	var reminders []DBReminder
+	for rows.Next() {
+		var reminder DBReminder
+		if err := rows.Scan(
+			&reminder.ID, &reminder.UserID, &reminder.ShowID, &reminder.EpisodeID,
+			&reminder.RemindAt, &reminder.ChatID, &reminder.ShowName,
+			&reminder.EpisodeTitle, &reminder.EpisodeNumber, &reminder.EpisodeSeason,
+		); err != nil {
+			return nil, err
+		}
+		reminders = append(reminders, reminder)
+	}
 
-func getShowNameByID(db *sql.DB, showID int64) (string, error) {
-	var name string
-	err := db.QueryRow(`SELECT name FROM shows WHERE id = ?`, showID).Scan(&name)
-	return name, err
+	return reminders, nil
 }
 
 func markReminderSent(db *sql.DB, reminder DBReminder) error {
@@ -463,22 +477,6 @@ func markReminderSent(db *sql.DB, reminder DBReminder) error {
 		return err
 	}
 	defer tx.Rollback()
-
-	// Delete the current reminder
-	_, err = tx.Exec(`DELETE FROM reminders WHERE id = ?`, reminder.ID)
-	if err != nil {
-		return err
-	}
-
-	// Update the show's last_watched_episode_id
-	_, err = tx.Exec(`
-		UPDATE shows
-		SET last_watched_episode_id = ?
-		WHERE id = ?
-	`, reminder.EpisodeID, reminder.ShowID)
-	if err != nil {
-		return err
-	}
 
 	// Get current episode details to find the next one
 	var currentSeason, currentNumber int
@@ -489,60 +487,32 @@ func markReminderSent(db *sql.DB, reminder DBReminder) error {
 		return err
 	}
 
-	// Find the next episode
-	var nextEpisode DBEpisode
-	var airedAtStr string
-	var fetchedAtStr string
+	var providerShowID string
+	err = tx.QueryRow(`SELECT provider_show_id FROM shows WHERE id = ?`, reminder.ShowID).Scan(&providerShowID)
+	if err != nil {
+		return err
+	}
 
-	err = tx.QueryRow(`
-		SELECT
-			id, provider, provider_show_id, provider_episode_id, season, number,
-			title, airdate, airtime, aired_at_utc, fetched_at
-		FROM episodes_cache
-		WHERE provider_show_id = (
-			SELECT provider_show_id FROM shows WHERE id = ?
-		)
-		AND (
-			(season = ? AND number > ?) OR
-			(season > ?)
-		)
-		ORDER BY season, number
-		LIMIT 1
-	`, reminder.ShowID, currentSeason, currentNumber, currentSeason).Scan(
-		&nextEpisode.ID, &nextEpisode.Provider, &nextEpisode.ProviderShowID, &nextEpisode.ProviderEpisodeID,
-		&nextEpisode.Season, &nextEpisode.Number, &nextEpisode.Title, &nextEpisode.Airdate, &nextEpisode.Airtime,
-		&airedAtStr, &fetchedAtStr,
-	)
-
-	if err == sql.ErrNoRows {
-		// No next episode found, just commit the delete and update
+	nextEpisode, err := findNextEpisodeByProviderID(tx, providerShowID, currentSeason, currentNumber)
+	if err != nil {
+		// No next episode found, delete the reminder
+		_, err = tx.Exec(`DELETE FROM reminders WHERE id = ?`, reminder.ID)
+		if err != nil {
+			return err
+		}
 		return tx.Commit()
 	}
-	if err != nil {
-		return err
-	}
 
-	// Parse timestamps
-	if airedAtStr != "" {
-		nextEpisode.AiredAtUTC, _ = time.Parse(time.RFC3339, airedAtStr)
-	}
-	if fetchedAtStr != "" {
-		nextEpisode.FetchedAt, _ = time.Parse(time.RFC3339, fetchedAtStr)
-	}
-
-	// Create reminder for next episode if it has an air date and notifications are enabled
-	var notificationsEnabled bool
-	err = tx.QueryRow(`SELECT notifications_enabled FROM shows WHERE id = ?`, reminder.ShowID).Scan(&notificationsEnabled)
-	if err != nil {
-		return err
-	}
-
-	if !nextEpisode.AiredAtUTC.IsZero() && notificationsEnabled {
+	if !nextEpisode.AiredAtUTC.IsZero() {
 		_, err = tx.Exec(`
-			INSERT INTO reminders (user_id, show_id, episode_id, remind_at, chat_id)
-			VALUES (?, ?, ?, ?, ?)
-			ON CONFLICT DO NOTHING
-		`, reminder.UserID, reminder.ShowID, nextEpisode.ID, nextEpisode.AiredAtUTC, reminder.ChatID)
+			UPDATE reminders SET episode_id = ?, remind_at = ? WHERE id = ?
+		`, nextEpisode.ID, nextEpisode.AiredAtUTC, reminder.ID)
+		if err != nil {
+			return err
+		}
+	} else {
+		// No air date, delete the reminder
+		_, err = tx.Exec(`DELETE FROM reminders WHERE id = ?`, reminder.ID)
 		if err != nil {
 			return err
 		}

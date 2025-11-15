@@ -582,7 +582,9 @@ func (handler *Handler) handleToggleNotificationsCallback(cb *tgbotapi.CallbackQ
 		handler.Bot.reply(msg.Chat.ID, "Error refreshing shows list")
 		return
 	}
-	userCtx.ShowsList = shows
+	handler.Bot.withUserContext(userID, func(ctx *UserContext) {
+		ctx.ShowsList = shows
+	})
 
 	// Re-show the show details
 	handler.handleShowCallback(cb, param)
@@ -639,7 +641,9 @@ func (handler *Handler) handleMarkNextWatchedCallback(cb *tgbotapi.CallbackQuery
 		handler.Bot.reply(msg.Chat.ID, "Error refreshing shows list")
 		return
 	}
-	userCtx.ShowsList = shows
+	handler.Bot.withUserContext(userID, func(ctx *UserContext) {
+		ctx.ShowsList = shows
+	})
 
 	// Re-show the show details
 	handler.handleShowCallback(cb, param)
