@@ -5,3 +5,4 @@ tmp/
 *.db-wal
 bot
 tvreminder
+.vscode/

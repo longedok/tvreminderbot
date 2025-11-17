@@ -50,6 +50,7 @@ type DBReminder struct {
 }
 
 type ShowProgress struct {
+	InternalID           int64
 	Name                 string
 	Season               sql.NullInt32
 	Episode              sql.NullInt32
@@ -158,7 +159,7 @@ func addShow(db *sql.DB, userID int64, name, provider string, showID int) (int64
 
 func listShowsWithProgress(db *sql.DB, userID int64) ([]ShowProgress, error) {
 	rows, err := db.Query(`
-		SELECT s.name, e.season, e.number, s.provider_show_id, s.notifications_enabled
+		SELECT s.id, s.name, e.season, e.number, s.provider_show_id, s.notifications_enabled
 		FROM shows s
 		LEFT JOIN episodes_cache e ON e.id = s.last_watched_episode_id
 		WHERE s.user_id = ?
@@ -174,7 +175,7 @@ func listShowsWithProgress(db *sql.DB, userID int64) ([]ShowProgress, error) {
 		var show ShowProgress
 		var providerShowID string
 		var notificationsEnabled int
-		err := rows.Scan(&show.Name, &show.Season, &show.Episode, &providerShowID, &notificationsEnabled)
+		err := rows.Scan(&show.InternalID, &show.Name, &show.Season, &show.Episode, &providerShowID, &notificationsEnabled)
 		if err != nil {
 			return nil, err
 		}

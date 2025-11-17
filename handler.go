@@ -68,59 +68,28 @@ func (handler *Handler) handleCommand(msg *tgbotapi.Message) {
 	}
 }
 
-func (handler *Handler) handleStartCommand(msg *tgbotapi.Message) {
-	chatID := msg.Chat.ID
-	startText := dedent(`
-	Hello! I'm a bot that helps you track your TV shows and notify you when new episodes air.
-
-	/add - Add a TV show to track
-	/shows - List your current shows
-	/history - List all your shows
-	`)
-	handler.Bot.reply(chatID, startText)
-}
-
-func (handler *Handler) handleHelpCommand(msg *tgbotapi.Message) {
-	chatID := msg.Chat.ID
-	helpText := dedent(`
-	Commands:
-
-	/add <show>
-	/shows - list your current shows
-	/history - list all your shows
-	/help - show this help
-	`)
-	handler.Bot.reply(chatID, helpText)
-}
-
 func (handler *Handler) handleCallback(cb *tgbotapi.CallbackQuery) {
-	data := cb.Data
-	parts := strings.Split(data, ":")
-	if len(parts) < 1 {
-		log.Printf("handleCallback: invalid callback data: %s", data)
+	action, callbackParam, found := strings.Cut(cb.Data, ":")
+	if !found {
+		log.Printf("handleCallback: invalid callback data: %s", cb.Data)
 		return
-	}
-	action := parts[0]
-	param := ""
-	if len(parts) > 1 {
-		param = parts[1]
 	}
 
 	switch action {
 	case "acceptShowName":
-		handler.handleShowNameCallback(cb, param)
+		handler.handleShowNameCallback(cb, callbackParam)
 	case "selectSeason":
-		handler.handleSeasonCallback(cb, param)
+		handler.handleSeasonCallback(cb, callbackParam)
 	case "selectEpisode":
-		handler.handleEpisodeCallback(cb, param)
+		handler.handleEpisodeCallback(cb, callbackParam)
 	case "selectShow":
-		handler.handleShowCallback(cb, param)
+		handler.handleSelectShowCallback(cb, callbackParam)
 	case "backToShows":
-		handler.handleBackToShowsCallback(cb)
+		handler.handleBackToShowsCallback(cb, callbackParam)
 	case "toggleNotifications":
-		handler.handleToggleNotificationsCallback(cb, param)
+		handler.handleToggleNotificationsCallback(cb, callbackParam)
 	case "markNextWatched":
-		handler.handleMarkNextWatchedCallback(cb, param)
+		handler.handleMarkNextWatchedCallback(cb, callbackParam)
 	case "cancel":
 		handler.handleCancelCallback(cb)
 	}
@@ -186,10 +155,10 @@ func (handler *Handler) searchAndSelectShow(query string, userID int64, chatID i
 	}
 }
 
-func (handler *Handler) handleShowNameCallback(cb *tgbotapi.CallbackQuery, param string) {
-	idx, err := strconv.Atoi(param)
+func (handler *Handler) handleShowNameCallback(cb *tgbotapi.CallbackQuery, callbackParam string) {
+	searchResultIdx, err := strconv.Atoi(callbackParam)
 	if err != nil {
-		log.Printf("handleShowNameCallback: invalid parameter: %s", param)
+		log.Printf("handleShowNameCallback: invalid callback parameter: %s", callbackParam)
 		return
 	}
 
@@ -204,7 +173,7 @@ func (handler *Handler) handleShowNameCallback(cb *tgbotapi.CallbackQuery, param
 		return
 	}
 
-	showSearchResult := userCtx.SearchResults[idx-1]
+	showSearchResult := userCtx.SearchResults[searchResultIdx-1]
 
 	internalID, err := addShow(
 		handler.DB, userID, showSearchResult.Name, "tvmaze", showSearchResult.ID,
@@ -287,10 +256,10 @@ func (handler *Handler) handleShowNameCallback(cb *tgbotapi.CallbackQuery, param
 	handler.Bot.answerCallbackQuery(cb.ID)
 }
 
-func (handler *Handler) handleSeasonCallback(cb *tgbotapi.CallbackQuery, param string) {
-	season, err := strconv.Atoi(param)
+func (handler *Handler) handleSeasonCallback(cb *tgbotapi.CallbackQuery, callbackParam string) {
+	season, err := strconv.Atoi(callbackParam)
 	if err != nil {
-		log.Printf("handleSeasonCallback: invalid season: %s", param)
+		log.Printf("handleSeasonCallback: invalid season: %s", callbackParam)
 		return
 	}
 
@@ -338,10 +307,10 @@ func (handler *Handler) makeEpisodeKeyboard(providerShowID string, season int) (
 	return inlineMarkup, nil
 }
 
-func (handler *Handler) handleEpisodeCallback(cb *tgbotapi.CallbackQuery, param string) {
-	episodeNumber, err := strconv.Atoi(param)
+func (handler *Handler) handleEpisodeCallback(cb *tgbotapi.CallbackQuery, callbackParam string) {
+	episodeNumber, err := strconv.Atoi(callbackParam)
 	if err != nil {
-		log.Printf("handleEpisodeCallback: invalid episode number: %s", param)
+		log.Printf("handleEpisodeCallback: invalid episode number: %s", callbackParam)
 		return
 	}
 
@@ -416,7 +385,7 @@ func (handler *Handler) handleEpisodeCallback(cb *tgbotapi.CallbackQuery, param 
 	handler.Bot.answerCallbackQuery(cb.ID)
 }
 
-// SHOWS command flow
+// SHOWS/HISTORY command flow
 
 func (handler *Handler) handleShowsCommand(msg *tgbotapi.Message) {
 	chatID := msg.Chat.ID
@@ -432,7 +401,7 @@ func (handler *Handler) handleShowsCommand(msg *tgbotapi.Message) {
 	handler.Bot.withUserContext(msg.From.ID, func(ctx *UserContext) {
 		ctx.ShowsList = shows
 	})
-	inlineMarkup := handler.makeShowsKeyboard(shows)
+	inlineMarkup := handler.makeShowsKeyboard(shows, "current")
 	handler.Bot.reply(chatID, "Your current shows:", ReplyOptions{ReplyMarkup: inlineMarkup})
 }
 
@@ -450,11 +419,11 @@ func (handler *Handler) handleHistoryCommand(msg *tgbotapi.Message) {
 	handler.Bot.withUserContext(msg.From.ID, func(ctx *UserContext) {
 		ctx.ShowsList = shows
 	})
-	inlineMarkup := handler.makeShowsKeyboard(shows)
+	inlineMarkup := handler.makeShowsKeyboard(shows, "history")
 	handler.Bot.reply(chatID, "Your show history:", ReplyOptions{ReplyMarkup: inlineMarkup})
 }
 
-func (handler *Handler) makeShowsKeyboard(shows []ShowProgress) *tgbotapi.InlineKeyboardMarkup {
+func (handler *Handler) makeShowsKeyboard(shows []ShowProgress, listType string) *tgbotapi.InlineKeyboardMarkup {
 	var rows [][][]string
 	for i, show := range shows {
 		line := show.Name
@@ -471,36 +440,33 @@ func (handler *Handler) makeShowsKeyboard(shows []ShowProgress) *tgbotapi.Inline
 				line += " - Next Ep Out ✅"
 			}
 		}
-		cbData := fmt.Sprintf("selectShow:%d", i)
+		cbData := fmt.Sprintf("selectShow:%d:%s", i, listType)
 		rows = append(rows, [][]string{{line, cbData}})
 	}
 
 	return makeKeyboardMarkup(rows)
 }
 
-func (handler *Handler) handleShowCallback(cb *tgbotapi.CallbackQuery, param string) {
-	idx, err := strconv.Atoi(param)
+func (handler *Handler) handleSelectShowCallback(cb *tgbotapi.CallbackQuery, callbackParam string) {
+	showIdxStr, listType, found := strings.Cut(callbackParam, ":")
+	if !found {
+		log.Printf("handleSelectShowCallback: invalid callback parameter: %s", callbackParam)
+		return
+	}
+	showIdx, err := strconv.Atoi(showIdxStr)
 	if err != nil {
-		log.Printf("handleShowCallback: invalid parameter: %s", param)
+		log.Printf("handleSelectShowCallback: invalid show index: %s", showIdxStr)
 		return
 	}
 
 	userID := cb.From.ID
 	msg := cb.Message
+	chatID := msg.Chat.ID
 
-	userCtx := handler.Bot.getUserContext(userID)
-	if userCtx == nil || len(userCtx.ShowsList) == 0 {
-		handler.Bot.reply(msg.Chat.ID, "No shows found. Please start over with /shows.")
-		handler.Bot.clearState(userID)
+	show, ok := handler.validateAndGetShow(userID, chatID, showIdx, listType)
+	if !ok {
 		return
 	}
-
-	if idx < 0 || idx >= len(userCtx.ShowsList) {
-		handler.Bot.reply(msg.Chat.ID, "Invalid show selection.")
-		return
-	}
-
-	show := userCtx.ShowsList[idx]
 
 	var infoText string
 	infoText += fmt.Sprintf("<b>%s</b>\n\n", show.Name)
@@ -528,9 +494,9 @@ func (handler *Handler) handleShowCallback(cb *tgbotapi.CallbackQuery, param str
 	if !show.NotificationsEnabled {
 		toggleText = "Enable Notifications"
 	}
-	rows = append(rows, [][]string{{toggleText, fmt.Sprintf("toggleNotifications:%d", idx)}})
-	rows = append(rows, [][]string{{"Mark next as watched", fmt.Sprintf("markNextWatched:%d", idx)}})
-	rows = append(rows, [][]string{{"<< Back to shows list", "backToShows"}})
+	rows = append(rows, [][]string{{toggleText, fmt.Sprintf("toggleNotifications:%d:%s", showIdx, listType)}})
+	rows = append(rows, [][]string{{"Mark next as watched", fmt.Sprintf("markNextWatched:%d:%s", showIdx, listType)}})
+	rows = append(rows, [][]string{{"<< Back to shows list", fmt.Sprintf("backToShows:%s", listType)}})
 	keyboard := makeKeyboardMarkup(rows)
 
 	handler.Bot.reply(
@@ -539,31 +505,53 @@ func (handler *Handler) handleShowCallback(cb *tgbotapi.CallbackQuery, param str
 	handler.Bot.answerCallbackQuery(cb.ID)
 }
 
-func (handler *Handler) handleToggleNotificationsCallback(cb *tgbotapi.CallbackQuery, param string) {
-	idx, err := strconv.Atoi(param)
+func (handler *Handler) validateAndGetShow(userID int64, chatID int64, showIdx int, listType string) (*ShowProgress, bool) {
+	userCtx := handler.Bot.getUserContext(userID)
+	if userCtx == nil || len(userCtx.ShowsList) == 0 {
+		if listType == "current" {
+			handler.Bot.reply(chatID, "No shows found. Please start over with /shows")
+		} else {
+			handler.Bot.reply(chatID, "No shows found. Please start over with /history")
+		}
+		handler.Bot.clearState(userID)
+		return nil, false
+	}
+	if showIdx < 0 || showIdx >= len(userCtx.ShowsList) {
+		handler.Bot.reply(chatID, "Invalid show selection.")
+		return nil, false
+	}
+	return &userCtx.ShowsList[showIdx], true
+}
+
+func findShowIndex(shows []ShowProgress, show ShowProgress) int {
+	for i, s := range shows {
+		if s.InternalID == show.InternalID {
+			return i
+		}
+	}
+	return -1
+}
+
+func (handler *Handler) handleToggleNotificationsCallback(cb *tgbotapi.CallbackQuery, callbackParam string) {
+	showIdxStr, listType, found := strings.Cut(callbackParam, ":")
+	if !found {
+		log.Printf("handleToggleNotificationsCallback: invalid callback parameter: %s", callbackParam)
+		return
+	}
+	showIdx, err := strconv.Atoi(showIdxStr)
 	if err != nil {
-		log.Printf("handleToggleNotificationsCallback: invalid parameter: %s", param)
+		log.Printf("handleToggleNotificationsCallback: invalid show index: %s", showIdxStr)
 		return
 	}
 
 	userID := cb.From.ID
 	msg := cb.Message
 
-	userCtx := handler.Bot.getUserContext(userID)
-	if userCtx == nil || len(userCtx.ShowsList) == 0 {
-		handler.Bot.reply(msg.Chat.ID, "No shows found. Please start over with /shows")
-		handler.Bot.clearState(userID)
+	show, ok := handler.validateAndGetShow(userID, msg.Chat.ID, showIdx, listType)
+	if !ok {
 		return
 	}
 
-	if idx < 0 || idx >= len(userCtx.ShowsList) {
-		handler.Bot.reply(msg.Chat.ID, "Invalid show selection.")
-		return
-	}
-
-	show := userCtx.ShowsList[idx]
-
-	// Get the show ID from the database
 	showID, _, err := getShowByUserAndName(handler.DB, userID, show.Name)
 	if err != nil {
 		handler.Bot.reply(msg.Chat.ID, "Error toggling notifications")
@@ -576,8 +564,12 @@ func (handler *Handler) handleToggleNotificationsCallback(cb *tgbotapi.CallbackQ
 		return
 	}
 
-	// Refresh the shows list
-	shows, err := listShowsWithProgress(handler.DB, userID)
+	var shows []ShowProgress
+	if listType == "current" {
+		shows, err = listCurrentShowsWithProgress(handler.DB, userID)
+	} else {
+		shows, err = listShowsWithProgress(handler.DB, userID)
+	}
 	if err != nil {
 		handler.Bot.reply(msg.Chat.ID, "Error refreshing shows list")
 		return
@@ -586,57 +578,59 @@ func (handler *Handler) handleToggleNotificationsCallback(cb *tgbotapi.CallbackQ
 		ctx.ShowsList = shows
 	})
 
-	// Re-show the show details
-	handler.handleShowCallback(cb, param)
+	newIdx := findShowIndex(shows, *show)
+	if newIdx == -1 {
+		handler.Bot.reply(msg.Chat.ID, "Error refreshing shows list")
+		return
+	}
+
+	handler.handleSelectShowCallback(cb, fmt.Sprintf("%d:%s", newIdx, listType))
 }
 
-func (handler *Handler) handleMarkNextWatchedCallback(cb *tgbotapi.CallbackQuery, param string) {
-	idx, err := strconv.Atoi(param)
+func (handler *Handler) handleMarkNextWatchedCallback(cb *tgbotapi.CallbackQuery, callbackParam string) {
+	showIdxStr, listType, found := strings.Cut(callbackParam, ":")
+	if !found {
+		log.Printf("handleMarkNextWatchedCallback: invalid callback parameter: %s", callbackParam)
+		return
+	}
+	showIdx, err := strconv.Atoi(showIdxStr)
 	if err != nil {
-		log.Printf("handleMarkNextWatchedCallback: invalid parameter: %s", param)
+		log.Printf("handleMarkNextWatchedCallback: invalid show index: %s", showIdxStr)
 		return
 	}
 
 	userID := cb.From.ID
 	msg := cb.Message
 
-	userCtx := handler.Bot.getUserContext(userID)
-	if userCtx == nil || len(userCtx.ShowsList) == 0 {
-		handler.Bot.reply(msg.Chat.ID, "No shows found. Please start over with /shows")
-		handler.Bot.clearState(userID)
+	show, ok := handler.validateAndGetShow(userID, msg.Chat.ID, showIdx, listType)
+	if !ok {
 		return
 	}
 
-	if idx < 0 || idx >= len(userCtx.ShowsList) {
-		handler.Bot.reply(msg.Chat.ID, "Invalid show selection.")
-		return
-	}
-
-	show := userCtx.ShowsList[idx]
-
-	// Get the show ID and provider_show_id from the database
 	showID, providerShowID, err := getShowByUserAndName(handler.DB, userID, show.Name)
 	if err != nil {
 		handler.Bot.reply(msg.Chat.ID, "Error finding show")
 		return
 	}
 
-	// Find the next episode
 	nextEpisode, err := findNextEpisode(handler.DB, providerShowID, show.Season, show.Episode)
 	if err != nil {
 		handler.Bot.reply(msg.Chat.ID, "No next episode found.")
 		return
 	}
 
-	// Update last watched to the next episode
 	err = updateLastWatchedEpisode(handler.DB, showID, nextEpisode.ID)
 	if err != nil {
 		handler.Bot.reply(msg.Chat.ID, "Error updating progress")
 		return
 	}
 
-	// Refresh the shows list
-	shows, err := listShowsWithProgress(handler.DB, userID)
+	var shows []ShowProgress
+	if listType == "current" {
+		shows, err = listCurrentShowsWithProgress(handler.DB, userID)
+	} else {
+		shows, err = listShowsWithProgress(handler.DB, userID)
+	}
 	if err != nil {
 		handler.Bot.reply(msg.Chat.ID, "Error refreshing shows list")
 		return
@@ -645,11 +639,18 @@ func (handler *Handler) handleMarkNextWatchedCallback(cb *tgbotapi.CallbackQuery
 		ctx.ShowsList = shows
 	})
 
-	// Re-show the show details
-	handler.handleShowCallback(cb, param)
+	newIdx := findShowIndex(shows, *show)
+	if newIdx == -1 {
+		handler.Bot.reply(msg.Chat.ID, "Error refreshing shows list")
+		return
+	}
+
+	handler.handleSelectShowCallback(cb, fmt.Sprintf("%d:%s", newIdx, listType))
 }
 
-func (handler *Handler) handleBackToShowsCallback(cb *tgbotapi.CallbackQuery) {
+func (handler *Handler) handleBackToShowsCallback(cb *tgbotapi.CallbackQuery, callbackParam string) {
+	listType := callbackParam
+
 	userID := cb.From.ID
 	msg := cb.Message
 
@@ -661,14 +662,20 @@ func (handler *Handler) handleBackToShowsCallback(cb *tgbotapi.CallbackQuery) {
 	}
 
 	shows := userCtx.ShowsList
-	inlineMarkup := handler.makeShowsKeyboard(shows)
+	inlineMarkup := handler.makeShowsKeyboard(shows, listType)
 
-	handler.Bot.reply(msg.Chat.ID, "Your shows:", ReplyOptions{ReplyMarkup: inlineMarkup, EditMessageID: msg.MessageID})
+	text := "Your shows:"
+	if listType == "current" {
+		text = "Your current shows:"
+	} else {
+		text = "Your show history:"
+	}
 
+	handler.Bot.reply(msg.Chat.ID, text, ReplyOptions{ReplyMarkup: inlineMarkup, EditMessageID: msg.MessageID})
 	handler.Bot.answerCallbackQuery(cb.ID)
 }
 
-// CANCEL command flow
+// CANCEL callback
 
 func (handler *Handler) handleCancelCallback(cb *tgbotapi.CallbackQuery) {
 	userID := cb.From.ID
@@ -679,4 +686,31 @@ func (handler *Handler) handleCancelCallback(cb *tgbotapi.CallbackQuery) {
 
 	cb_response := tgbotapi.NewCallback(cb.ID, "")
 	handler.Bot.BotApi.Request(cb_response)
+}
+
+// START/HELP commands
+
+func (handler *Handler) handleStartCommand(msg *tgbotapi.Message) {
+	chatID := msg.Chat.ID
+	startText := dedent(`
+	Hello! I'm a bot that helps you track your TV shows and notify you when new episodes air.
+
+	/add - Add a TV show to track
+	/shows - List your current shows
+	/history - List all your shows
+	`)
+	handler.Bot.reply(chatID, startText)
+}
+
+func (handler *Handler) handleHelpCommand(msg *tgbotapi.Message) {
+	chatID := msg.Chat.ID
+	helpText := dedent(`
+	Commands:
+
+	/add <show>
+	/shows - list your current shows
+	/history - list all your shows
+	/help - show this help
+	`)
+	handler.Bot.reply(chatID, helpText)
 }
